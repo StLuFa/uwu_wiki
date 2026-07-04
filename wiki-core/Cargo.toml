@@ -1,0 +1,23 @@
+[package]
+name = "wiki-core"
+version = "0.0.0"
+edition = "2024"
+description = "uwu_wiki 核心：Block 引擎 + Document/Op 模型 + 全部存储/LLM 端口 trait 定义（零实现）"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+thiserror = "1"
+
+[features]
+default = []
+backlinks = []
+attachments = []
+versioning = []
+
+[dev-dependencies]
+wiki-testkit = { path = "../wiki-testkit" }
+tokio = { version = "1", features = ["rt", "macros"] }

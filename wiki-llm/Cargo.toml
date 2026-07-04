@@ -1,0 +1,21 @@
+[package]
+name = "wiki-llm"
+version = "0.0.0"
+edition = "2024"
+description = "uwu_wiki LLM 横切层：领域无关 LlmCapability + TextUnit，LlmClient 注入，不依赖引擎"
+
+[dependencies]
+wiki-core = { path = "../wiki-core" }
+wiki-collab = { path = "../wiki-collab" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+
+[features]
+default = []
+hybrid-search = []
+full-text = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+wiki-testkit = { path = "../wiki-testkit" }
