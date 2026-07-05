@@ -76,13 +76,13 @@ pkg/uwu_wiki/
 
 | 模块 | README | 说明 |
 |---|---|---|
-| wiki-core | [README](wiki-core/README.md) | Block 引擎 + Document/Op 模型 + 存储端口 |
-| wiki-llm | [README](wiki-llm/README.md) | DefaultLlmEngine + RAG 管线 + 增量 Embedding |
-| wiki-table | [README](wiki-table/README.md) | TableStore + TableView + LlmFill |
-| wiki-graph | [README](wiki-graph/README.md) | GraphStore + 遍历 + Mermaid/PlantUML 导出 |
-| wiki-collab | [README](wiki-collab/README.md) | CollabDoc CRDT 同步 + PermissionFilter |
-| wiki-workflow | [README](wiki-workflow/README.md) | Ingest/Query/Lint 三管线 |
-| wiki-testkit | [README](wiki-testkit/README.md) | 7 端口内存参考实现 |
+| wiki-core | [README](crates/wiki-core/README.md) | Block 引擎 + Document/Op 模型 + 存储端口 |
+| wiki-llm | [README](crates/wiki-llm/README.md) | DefaultLlmEngine + RAG 管线 + 增量 Embedding |
+| wiki-table | [README](crates/wiki-table/README.md) | TableStore + TableView + LlmFill |
+| wiki-graph | [README](crates/wiki-graph/README.md) | GraphStore + 遍历 + Mermaid/PlantUML 导出 |
+| wiki-collab | [README](crates/wiki-collab/README.md) | CollabDoc CRDT 同步 + PermissionFilter |
+| wiki-workflow | [README](crates/wiki-workflow/README.md) | Ingest/Query/Lint 三管线 |
+| wiki-testkit | [README](crates/wiki-testkit/README.md) | 7 端口内存参考实现 |
 
 ### Feature 矩阵
 
