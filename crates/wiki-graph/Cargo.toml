@@ -8,6 +8,7 @@ description = "uwu_wiki 智能图：流程图/思维导图节点模型（经 Tex
 wiki-core = { path = "../wiki-core" }
 wiki-llm = { path = "../wiki-llm" }
 serde = { version = "1", features = ["derive"] }
+rand = "0.8"
 
 [features]
 default = []

@@ -37,12 +37,12 @@ pub mod lint;
 pub mod query;
 
 use std::sync::Arc;
-use wiki_core::{Result, WikiSpace};
+use wiki_core::{Result, WikiConfig, WikiSpace};
 use wiki_llm::LlmCapability;
 
 // Re-export key types for convenience.
 pub use ingest::{Contradiction, ContradictionSeverity, IngestPipeline, IngestSource, IngestResult};
-pub use lint::{LintConfig, LintReport, WikiLinter};
+pub use lint::{LintReport, SchedulerHandle, WikiLinter};
 pub use query::{QueryPipeline, QueryResult, WriteBackPolicy, WriteBackResult};
 
 // ===========================================================================
@@ -53,11 +53,24 @@ pub use query::{QueryPipeline, QueryResult, WriteBackPolicy, WriteBackResult};
 pub struct WikiDomain {
     llm: Arc<dyn LlmCapability>,
     space: Arc<WikiSpace>,
+    config: Arc<WikiConfig>,
 }
 
 impl WikiDomain {
     pub fn new(llm: Arc<dyn LlmCapability>, space: Arc<WikiSpace>) -> Self {
-        Self { llm, space }
+        Self {
+            llm,
+            space,
+            config: Arc::new(WikiConfig::default()),
+        }
+    }
+
+    pub fn with_config(
+        llm: Arc<dyn LlmCapability>,
+        space: Arc<WikiSpace>,
+        config: Arc<WikiConfig>,
+    ) -> Self {
+        Self { llm, space, config }
     }
 
     /// 消化新原料进 wiki。
@@ -90,18 +103,18 @@ impl WikiDomain {
 
     /// 触发全量审计。
     ///
-    /// 委托给 [`WikiLinter::run`]，使用默认 [`LintConfig`]。
+    /// 委托给 [`WikiLinter::run`]，使用当前配置。
     pub async fn lint(&self) -> Result<LintReport> {
         let linter = WikiLinter::new(
             self.llm.clone(),
             self.space.clone(),
-            LintConfig::default(),
+            self.config.clone(),
         );
         linter.run().await
     }
 
-    /// 触发审计（自定义配置）。
-    pub async fn lint_with_config(&self, config: LintConfig) -> Result<LintReport> {
+    /// 触发审计（使用自定义配置）。
+    pub async fn lint_with_config(&self, config: Arc<WikiConfig>) -> Result<LintReport> {
         let linter = WikiLinter::new(self.llm.clone(), self.space.clone(), config);
         linter.run().await
     }
@@ -114,6 +127,11 @@ impl WikiDomain {
     /// 获取内部 WikiSpace 引用。
     pub fn space(&self) -> &Arc<WikiSpace> {
         &self.space
+    }
+
+    /// 获取当前配置引用。
+    pub fn config(&self) -> &Arc<WikiConfig> {
+        &self.config
     }
 }
 

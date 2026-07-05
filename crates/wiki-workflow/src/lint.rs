@@ -13,7 +13,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use wiki_core::{DocId, LinkTarget, Result, SpaceId, WikiSpace};
+use wiki_core::{cosine_similarity, DocId, LinkTarget, Result, SpaceId, WikiConfig, WikiSpace};
 use wiki_llm::{LlmCapability, TextUnit};
 
 // ===========================================================================
@@ -41,33 +41,6 @@ pub struct LintReport {
     pub total_pages: usize,
 }
 
-/// Lint 配置。
-#[derive(Debug, Clone)]
-pub struct LintConfig {
-    /// 重复检测的余弦相似度阈值（默认 0.92）。
-    pub duplicate_threshold: f32,
-    /// 是否用 LLM 检查语义过时。
-    pub stale_check_llm: bool,
-    /// 是否自动修复断链。
-    pub auto_fix_broken_links: bool,
-    /// 是否自动为缺页创建占位页面。
-    pub auto_create_missing_pages: bool,
-    /// 过时阈值（多少天未更新视为可能过时）。
-    pub stale_days_threshold: i64,
-}
-
-impl Default for LintConfig {
-    fn default() -> Self {
-        Self {
-            duplicate_threshold: 0.92,
-            stale_check_llm: false,
-            auto_fix_broken_links: true,
-            auto_create_missing_pages: false,
-            stale_days_threshold: 90,
-        }
-    }
-}
-
 // ===========================================================================
 // WikiLinter
 // ===========================================================================
@@ -76,23 +49,24 @@ impl Default for LintConfig {
 pub struct WikiLinter {
     llm: Arc<dyn LlmCapability>,
     space: Arc<WikiSpace>,
-    config: LintConfig,
+    config: Arc<WikiConfig>,
 }
 
 impl WikiLinter {
-    pub fn new(llm: Arc<dyn LlmCapability>, space: Arc<WikiSpace>, config: LintConfig) -> Self {
+    pub fn new(llm: Arc<dyn LlmCapability>, space: Arc<WikiSpace>, config: Arc<WikiConfig>) -> Self {
         Self { llm, space, config }
     }
 
     /// 执行全量 Lint 扫描。
+    #[tracing::instrument(skip(self))]
     pub async fn run(&self) -> Result<LintReport> {
         let now = Utc::now();
-        let all_docs = self.space.list_docs(0, 500).await?;
+        let all_docs = self.space.list_docs(0, self.config.lint.list_limit).await?;
         let total = all_docs.len();
 
         // 并行执行各检查项（顺序执行，实际可并行）。
         let orphan_pages = self.check_orphans(&all_docs).await?;
-        let broken_links_fixed = if self.config.auto_fix_broken_links {
+        let broken_links_fixed = if self.config.lint.auto_fix_broken_links {
             self.check_and_fix_broken_links(&all_docs).await?
         } else {
             0
@@ -100,7 +74,7 @@ impl WikiLinter {
         let missing_pages = self.check_missing_pages(&all_docs).await?;
         let stale_pages = self.check_stale_pages(&all_docs).await?;
         let duplicate_candidates = self.check_duplicates(&all_docs).await?;
-        let contradictions = self.check_contradictions(&all_docs).await?;
+        let contradictions = self.check_contradictions(&all_docs, &duplicate_candidates).await?;
 
         Ok(LintReport {
             space_id: self.space.id.clone(),
@@ -166,7 +140,7 @@ impl WikiLinter {
             .collect();
 
         // 若配置允许，为缺页创建空白占位页。
-        if self.config.auto_create_missing_pages {
+        if self.config.lint.auto_create_missing_pages {
             for name in &missing {
                 let root = wiki_core::Block::new(
                     wiki_core::BlockType::Paragraph,
@@ -184,25 +158,80 @@ impl WikiLinter {
     // ---- 过时检测 ----
 
     /// 过时 = 超过阈值天数未更新。
+    ///
+    /// 若启用 `stale_check_llm`，对时间过时的文档进一步用 LLM 做语义级判断：
+    /// 只有 LLM 确认内容已过时的才会被标记。这避免了"经典但不过时"的文档被误报。
     async fn check_stale_pages(&self, all_docs: &[DocId]) -> Result<Vec<(DocId, String)>> {
-        let threshold = Utc::now() - Duration::days(self.config.stale_days_threshold);
+        let threshold = Utc::now() - Duration::days(self.config.lint.stale_days_threshold);
         let mut stale = Vec::new();
+        let max_candidates = self.config.lint.stale_check_llm_max_candidates;
+        let mut llm_checked = 0usize;
 
         for doc_id in all_docs {
             if let Ok(Some(doc)) = self.space.get_doc(doc_id).await {
                 let last_updated = doc.updated_at();
                 if last_updated < threshold {
-                    let reason = format!(
+                    let base_reason = format!(
                         "{} 天未更新（最后更新于 {}）",
-                        self.config.stale_days_threshold,
+                        self.config.lint.stale_days_threshold,
                         last_updated.format("%Y-%m-%d")
                     );
-                    // 若启用 LLM 检查，可在此做语义过时判断。
-                    if self.config.stale_check_llm {
-                        // TODO: LLM 语义过时检测。
-                        // 抽样读取页面内容，判断信息是否已过时。
+
+                    let mut is_stale = true;
+                    let mut llm_reason = String::new();
+
+                    // LLM 语义过时检测。
+                    if self.config.lint.stale_check_llm && llm_checked < max_candidates {
+                        llm_checked += 1;
+
+                        let text: String = doc
+                            .blocks
+                            .iter()
+                            .map(|b| b.content.as_plain_text())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let snippet: String = text.chars().take(2000).collect();
+
+                        let prompt = format!(
+                            "当前日期: {today}。评估以下 wiki 页面内容是否已过时或不再准确。\
+                             \n\n## 页面内容\n{snippet}\n\n## 任务\n\
+                             以 JSON 输出（只输出 JSON）：\n\
+                             ```json\n\
+                             {{\n  \"is_stale\": true,\n  \"reason\": \"过时原因的简要中文描述\"\n\
+                             }}\n\
+                             ```\n\
+                             若内容仍然准确、不过时，将 is_stale 设为 false。",
+                            today = Utc::now().format("%Y-%m-%d"),
+                        );
+
+                        if let Ok(response) = self.llm.qa(&prompt, None).await {
+                            let json_str =
+                                super::ingest::extract_json_block(&response.answer)
+                                    .unwrap_or(&response.answer);
+                            if let Ok(parsed) =
+                                serde_json::from_str::<serde_json::Value>(json_str)
+                            {
+                                let llm_says_stale = parsed
+                                    .get("is_stale")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(true); // 解析失败默认认为过时
+                                if !llm_says_stale {
+                                    is_stale = false;
+                                }
+                                if let Some(r) = parsed
+                                    .get("reason")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    llm_reason = format!(" [LLM: {r}]");
+                                }
+                            }
+                        }
                     }
-                    stale.push((doc_id.clone(), reason));
+
+                    if is_stale {
+                        stale.push((doc_id.clone(), format!("{base_reason}{llm_reason}")));
+                    }
                 }
             }
         }
@@ -218,7 +247,7 @@ impl WikiLinter {
     ) -> Result<Vec<(DocId, DocId, f32)>> {
         // 收集所有文档的纯文本。
         let mut texts: Vec<(DocId, String)> = Vec::new();
-        for doc_id in all_docs.iter().take(200) {
+        for doc_id in all_docs.iter().take(self.config.lint.duplicate_scan_limit) {
             // 限制扫描规模。
             if let Ok(Some(doc)) = self.space.get_doc(doc_id).await {
                 let plain = doc
@@ -227,7 +256,7 @@ impl WikiLinter {
                     .map(|b| b.content.as_plain_text())
                     .collect::<Vec<_>>()
                     .join(" ");
-                if plain.len() > 50 {
+                if plain.len() > self.config.lint.duplicate_min_text_len {
                     texts.push((doc_id.clone(), plain));
                 }
             }
@@ -250,7 +279,7 @@ impl WikiLinter {
         for i in 0..embeddings.len() {
             for j in (i + 1)..embeddings.len() {
                 let sim = cosine_similarity(&embeddings[i], &embeddings[j]);
-                if sim >= self.config.duplicate_threshold {
+                if sim >= self.config.lint.duplicate_threshold {
                     duplicates.push((texts[i].0.clone(), texts[j].0.clone(), sim));
                 }
             }
@@ -263,28 +292,179 @@ impl WikiLinter {
 
     // ---- 矛盾检测 ----
 
-    /// 矛盾检测：LLM 抽样高优先级页面，检查语义矛盾。
-    async fn check_contradictions(&self, all_docs: &[DocId]) -> Result<Vec<String>> {
-        let _ = all_docs; // TODO: LLM 抽样语义矛盾检测
-        // 完整实现需用 LLM 抽样检查页面间的语义矛盾。
-        // 当前为骨架——返回空列表。
-        Ok(Vec::new())
+    /// 矛盾检测：对高相似度但非重复的文档对，用 LLM 做语义级矛盾检查。
+    ///
+    /// 筛选相似度在 `[contradiction_min_similarity, duplicate_threshold)` 区间的文档对，
+    /// 取 top-N（由 `contradiction_max_candidates` 控制），对每对调用 LLM 检测事实矛盾。
+    async fn check_contradictions(
+        &self,
+        all_docs: &[DocId],
+        duplicate_candidates: &[(DocId, DocId, f32)],
+    ) -> Result<Vec<String>> {
+        let _ = all_docs;
+
+        // 筛选"高度相似但非明显重复"的候选对（相似度在中间区间）。
+        let min_sim = self.config.lint.contradiction_min_similarity;
+        let max_sim = self.config.lint.duplicate_threshold;
+        let max_candidates = self.config.lint.contradiction_max_candidates;
+
+        let candidates: Vec<&(DocId, DocId, f32)> = duplicate_candidates
+            .iter()
+            .filter(|(_, _, sim)| *sim >= min_sim && *sim < max_sim)
+            .take(max_candidates)
+            .collect();
+
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut contradictions = Vec::new();
+
+        for (doc_a, doc_b, sim) in candidates {
+            // 读取两个文档的文本内容。
+            let text_a = match self.space.get_doc(doc_a).await {
+                Ok(Some(doc)) => doc
+                    .blocks
+                    .iter()
+                    .map(|b| b.content.as_plain_text())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => continue,
+            };
+            let text_b = match self.space.get_doc(doc_b).await {
+                Ok(Some(doc)) => doc
+                    .blocks
+                    .iter()
+                    .map(|b| b.content.as_plain_text())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => continue,
+            };
+
+            // 截断过长文本以控制 token 消耗。
+            let max_chars = 2000;
+            let text_a: String = text_a.chars().take(max_chars).collect();
+            let text_b: String = text_b.chars().take(max_chars).collect();
+
+            // 用 LLM 做语义矛盾检测。
+            let prompt = format!(
+                "你是一个知识库质量检查器。请检查以下两段文本是否存在事实性矛盾。\n\
+                 \n\
+                 ## 文本 A (相似度: {sim:.3})\n\
+                 {text_a}\n\
+                 \n\
+                 ## 文本 B\n\
+                 {text_b}\n\
+                 \n\
+                 ## 任务\n\
+                 识别所有事实性矛盾。以 JSON 格式输出（只输出 JSON）：\n\
+                 ```json\n\
+                 {{\n\
+                   \"has_contradiction\": true,\n\
+                   \"description\": \"对矛盾的简要中文描述\"\n\
+                 }}\n\
+                 ```\n\
+                 若无矛盾则返回：\n\
+                 ```json\n\
+                 {{\n\
+                   \"has_contradiction\": false,\n\
+                   \"description\": \"\"\n\
+                 }}\n\
+                 ```"
+            );
+
+            let response = self.llm.qa(&prompt, None).await.unwrap_or_else(|_| {
+                wiki_llm::QaAnswer {
+                    answer: r#"{"has_contradiction":false,"description":""}"#.into(),
+                    citations: vec![],
+                }
+            });
+
+            // 解析 LLM 响应。
+            let json_str = super::ingest::extract_json_block(&response.answer)
+                .unwrap_or(&response.answer);
+
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if parsed
+                    .get("has_contradiction")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let desc = parsed
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(无描述)")
+                        .to_string();
+                    contradictions.push(format!(
+                        "[{} ↔ {}] {}",
+                        doc_a, doc_b, desc
+                    ));
+                }
+            }
+        }
+
+        Ok(contradictions)
+    }
+
+    // ---- 定时调度 ----
+
+    /// 启动周期性 Lint 扫描。
+    ///
+    /// 每隔 `interval` 执行一次全量扫描，通过 `on_report` 回调传递结果。
+    /// 返回 [`SchedulerHandle`]，调用 `.shutdown()` 可优雅停止。
+    pub fn run_periodic<F>(
+        self: Arc<Self>,
+        interval: std::time::Duration,
+        on_report: F,
+    ) -> SchedulerHandle
+    where
+        F: Fn(LintReport) + Send + 'static,
+    {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        tokio::spawn(async move {
+            let mut interval_timer = tokio::time::interval(interval);
+            // 跳过第一次立即触发（让调用方有时间准备），首次在 interval 后执行。
+            interval_timer.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = interval_timer.tick() => {
+                        match self.run().await {
+                            Ok(report) => on_report(report),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "lint scan failed, will retry at next interval");
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        SchedulerHandle {
+            shutdown: shutdown_tx,
+        }
     }
 }
 
 // ===========================================================================
-// 工具函数
+// 调度器句柄
 // ===========================================================================
 
-/// 余弦相似度。
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
+/// 周期性 Lint 扫描的句柄，用于优雅关闭。
+pub struct SchedulerHandle {
+    shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl SchedulerHandle {
+    /// 发送关闭信号，后台任务将在当前周期完成后退出。
+    pub fn shutdown(self) {
+        let _ = self.shutdown.send(true);
     }
 }
 
@@ -311,7 +491,7 @@ mod tests {
             Arc::new(wiki_llm::mock::AllowAllPermissionFilter),
         ));
         let space = Arc::new(WikiSpace::new(SpaceId::default(), Arc::new(storage)));
-        WikiLinter::new(engine, space, LintConfig::default())
+        WikiLinter::new(engine, space, Arc::new(WikiConfig::default()))
     }
 
     #[tokio::test]
@@ -340,7 +520,7 @@ mod tests {
         let root = Block::new(BlockType::Paragraph, BlockContent::text("orphan"), "test");
         space.create_doc("Orphan Page", root).await.unwrap();
 
-        let linter = WikiLinter::new(engine, space.clone(), LintConfig::default());
+        let linter = WikiLinter::new(engine, space.clone(), Arc::new(WikiConfig::default()));
         let report = linter.run().await.unwrap();
         assert_eq!(report.total_pages, 1);
         // 该页面无入链 → 孤页

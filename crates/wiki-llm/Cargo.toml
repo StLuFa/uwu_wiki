@@ -10,11 +10,14 @@ wiki-collab = { path = "../wiki-collab" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
+tokio = { version = "1", features = ["time"] }
+tracing = "0.1"
 
 [features]
 default = []
 hybrid-search = []
 full-text = []
+test-utils = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

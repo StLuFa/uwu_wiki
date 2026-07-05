@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use wiki_core::{Block, BlockContent, BlockType, DocId, Op, Result, WikiSpace};
+use wiki_core::{Block, BlockContent, BlockType, DocId, Op, Result, WikiConfig, WikiSpace};
 use wiki_llm::{LlmCapability, QaAnswer};
 
 // ===========================================================================
@@ -80,11 +80,24 @@ struct WriteBackEval {
 pub struct QueryPipeline {
     llm: Arc<dyn LlmCapability>,
     space: Arc<WikiSpace>,
+    config: Arc<WikiConfig>,
 }
 
 impl QueryPipeline {
     pub fn new(llm: Arc<dyn LlmCapability>, space: Arc<WikiSpace>) -> Self {
-        Self { llm, space }
+        Self {
+            llm,
+            space,
+            config: Arc::new(WikiConfig::default()),
+        }
+    }
+
+    pub fn with_config(
+        llm: Arc<dyn LlmCapability>,
+        space: Arc<WikiSpace>,
+        config: Arc<WikiConfig>,
+    ) -> Self {
+        Self { llm, space, config }
     }
 
     /// 执行问答（不反写）。
@@ -132,7 +145,7 @@ impl QueryPipeline {
             }
             WriteBackPolicy::AskFirst => {
                 // AskFirst：仍执行评估，但不自动写回——调用方检查 write_back 字段后决定。
-                eval.has_new_knowledge && eval.confidence >= 0.7
+                eval.has_new_knowledge && eval.confidence >= self.config.query.write_back_confidence_threshold
             }
         };
 
@@ -214,7 +227,7 @@ impl QueryPipeline {
         eval: &WriteBackEval,
     ) -> Result<WriteBackResult> {
         // 搜索目标页面。
-        let hits = self.llm.search(target_title, 3).await?;
+        let hits = self.llm.search(target_title, self.config.query.write_back_search_top_k).await?;
         let target_doc_id = hits
             .first()
             .and_then(|(unit, _)| unit.path.first().cloned())

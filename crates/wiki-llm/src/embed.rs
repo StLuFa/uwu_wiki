@@ -45,6 +45,36 @@ impl EmbeddingCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    // ---- 持久化 ----
+
+    /// 将缓存序列化为 JSON 写入文件。
+    ///
+    /// 格式：`[(block_id, vector, version), ...]`
+    pub fn persist_to_file(&self, path: &std::path::Path) -> wiki_core::Result<()> {
+        let data: Vec<(&String, &(Vec<f32>, u64))> = self.entries.iter().collect();
+        let json = serde_json::to_string_pretty(&data)
+            .map_err(|e| wiki_core::WikiError::Serialization(e.to_string()))?;
+        std::fs::write(path, json)
+            .map_err(|e| wiki_core::WikiError::Storage(format!("failed to write cache: {e}")))?;
+        Ok(())
+    }
+
+    /// 从 JSON 文件恢复缓存（与 [`persist_to_file`](Self::persist_to_file) 配对）。
+    pub fn load_from_file(
+        &mut self,
+        path: &std::path::Path,
+    ) -> wiki_core::Result<usize> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| wiki_core::WikiError::Storage(format!("failed to read cache: {e}")))?;
+        let data: Vec<(String, (Vec<f32>, u64))> = serde_json::from_str(&json)
+            .map_err(|e| wiki_core::WikiError::Serialization(e.to_string()))?;
+        let count = data.len();
+        for (id, (vec, ver)) in data {
+            self.entries.insert(id, (vec, ver));
+        }
+        Ok(count)
+    }
 }
 
 // ===========================================================================
@@ -200,5 +230,29 @@ mod tests {
         cache.load("x", vec![1.0, 2.0], 5);
         assert!(cache.get("x", 5).is_some());
         assert!(cache.get("x", 6).is_none()); // 缓存版本 5 < 需要 6
+    }
+
+    #[test]
+    fn cache_persist_and_reload() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("wiki_embed_cache_test.json");
+
+        let mut cache = EmbeddingCache::new();
+        cache.load("a", vec![0.1, 0.2], 3);
+        cache.load("b", vec![0.3, 0.4], 5);
+
+        // 持久化。
+        cache.persist_to_file(&path).unwrap();
+        assert!(path.exists());
+
+        // 从文件恢复。
+        let mut restored = EmbeddingCache::new();
+        let count = restored.load_from_file(&path).unwrap();
+        assert_eq!(count, 2);
+        assert!(restored.get("a", 3).is_some());
+        assert!(restored.get("b", 5).is_some());
+
+        // 清理。
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -18,8 +18,8 @@ use crate::TextUnit;
 // 混合检索
 // ===========================================================================
 
-/// RRF（Reciprocal Rank Fusion）参数。
-const RRF_K: f32 = 60.0;
+/// RRF（Reciprocal Rank Fusion）默认 k 参数。
+pub const DEFAULT_RRF_K: f32 = 60.0;
 
 /// 混合检索结果：融合后的统一命中项。
 #[derive(Debug, Clone)]
@@ -38,12 +38,14 @@ pub struct HybridHit {
 /// * `query_vec` — 查询的 embedding 向量。
 /// * `text_query` — 查询的文本分解。
 /// * `top_k` — 融合后保留条数。
+/// * `rrf_k` — RRF 常数 k。
 pub async fn hybrid_search(
     vector: &dyn VectorStore,
     text: &dyn TextIndex,
     query_vec: Vec<f32>,
     text_query: &TextQuery,
     top_k: usize,
+    rrf_k: f32,
 ) -> crate::Result<Vec<HybridHit>> {
     // 两路并行检索。
     let (vec_hits, text_hits) = (
@@ -55,7 +57,7 @@ pub async fn hybrid_search(
     let (vec_hits, text_hits) = (vec_hits.await?, text_hits.await?);
 
     // RRF 融合。
-    let merged = reciprocal_rank_fusion(&vec_hits, &text_hits, top_k);
+    let merged = reciprocal_rank_fusion(&vec_hits, &text_hits, top_k, rrf_k);
 
     Ok(merged)
 }
@@ -69,6 +71,7 @@ pub fn reciprocal_rank_fusion(
     vec_hits: &[VectorSearchResult],
     text_hits: &[TextHit],
     top_k: usize,
+    rrf_k: f32,
 ) -> Vec<HybridHit> {
     let mut scores: HashMap<String, f32> = HashMap::new();
     let mut snippets: HashMap<String, String> = HashMap::new();
@@ -76,7 +79,7 @@ pub fn reciprocal_rank_fusion(
     // 语义路：rank 从 1 开始。
     for (i, hit) in vec_hits.iter().enumerate() {
         let rank = (i + 1) as f32;
-        *scores.entry(hit.id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank);
+        *scores.entry(hit.id.clone()).or_insert(0.0) += 1.0 / (rrf_k + rank);
         snippets
             .entry(hit.id.clone())
             .or_insert_with(|| hit.metadata.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string());
@@ -85,7 +88,7 @@ pub fn reciprocal_rank_fusion(
     // 精确路。
     for (i, hit) in text_hits.iter().enumerate() {
         let rank = (i + 1) as f32;
-        *scores.entry(hit.block_id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank);
+        *scores.entry(hit.block_id.clone()).or_insert(0.0) += 1.0 / (rrf_k + rank);
         if !hit.snippet.is_empty() {
             snippets
                 .entry(hit.block_id.clone())
@@ -222,6 +225,7 @@ pub fn make_text_query(query: &str) -> TextQuery {
         phrase: Some(query.to_string()),
         filter: None,
         mode: MatchMode::Exact,
+        bool_op: None,
     }
 }
 
@@ -248,7 +252,7 @@ mod tests {
             snippet: "BBB".into(),
             score: 1.0,
         }];
-        let merged = reciprocal_rank_fusion(&vec, &txt, 5);
+        let merged = reciprocal_rank_fusion(&vec, &txt, 5, DEFAULT_RRF_K);
         // b 在两路都出现 → RRF 分更高。
         assert_eq!(merged[0].block_id, "b");
         assert!(merged[0].score > merged[1].score);
@@ -261,7 +265,7 @@ mod tests {
             score: 0.9,
             metadata: serde_json::json!({}),
         }];
-        let merged = reciprocal_rank_fusion(&vec, &[], 5);
+        let merged = reciprocal_rank_fusion(&vec, &[], 5, DEFAULT_RRF_K);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].block_id, "x");
     }

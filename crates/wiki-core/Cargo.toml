@@ -11,6 +11,7 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 thiserror = "1"
+tracing = "0.1"
 
 [features]
 default = []

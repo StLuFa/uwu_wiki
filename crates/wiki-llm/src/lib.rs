@@ -28,11 +28,14 @@
 
 pub mod embed;
 pub mod engine;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
 pub mod rag;
+pub mod retry;
 
 pub use embed::{diff_embed, DiffEmbedResult, EmbedUnit, EmbeddingCache};
 pub use engine::DefaultLlmEngine;
+#[cfg(any(test, feature = "test-utils"))]
 pub use mock::{AllowAllPermissionFilter, DenyListPermissionFilter, MockLlmClient};
 
 use async_trait::async_trait;

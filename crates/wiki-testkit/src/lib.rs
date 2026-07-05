@@ -8,9 +8,9 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use wiki_core::storage::{
-    BlobId, BlobStore, BlockChange, ChangeKind, DocDiff, DocStore, DocVersionStore, LinkStore,
-    MatchMode, OpLog, TextHit, TextIndex, TextQuery, VectorSearchResult, VectorStore, VersionEntry,
-    VersionId, WikiStorage,
+    BlobId, BlobStore, BlockChange, BoolOp, ChangeKind, DocDiff, DocStore, DocVersionStore,
+    LinkStore, MatchMode, OpLog, TextHit, TextIndex, TextQuery, VectorSearchResult, VectorStore,
+    VersionEntry, VersionId, WikiStorage,
 };
 use wiki_core::{BlockId, DocId, Document, Result, WikiError, WikiLink};
 
@@ -72,14 +72,13 @@ struct MemVectorStore {
 /// 向量记录：(向量, 元数据)。
 type VectorRecord = (Vec<f32>, serde_json::Value);
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
+/// 简单的 JSON 字段匹配：filter 中的每个 key-value 须在 meta 中完全匹配。
+fn filter_matches(filter: &serde_json::Value, meta: &serde_json::Value) -> bool {
+    match (filter, meta) {
+        (serde_json::Value::Object(f), serde_json::Value::Object(m)) => {
+            f.iter().all(|(k, v)| m.get(k) == Some(v))
+        }
+        _ => filter == meta,
     }
 }
 
@@ -105,16 +104,20 @@ impl VectorStore for MemVectorStore {
         collection: &str,
         query: Vec<f32>,
         top_k: usize,
-        _filter: Option<serde_json::Value>,
+        filter: Option<serde_json::Value>,
     ) -> Result<Vec<VectorSearchResult>> {
         let data = self.data.lock();
         let mut hits: Vec<VectorSearchResult> = data
             .get(collection)
             .map(|c| {
                 c.iter()
+                    .filter(|(_, (_, meta))| match &filter {
+                        Some(f) => filter_matches(f, meta),
+                        None => true,
+                    })
                     .map(|(id, (vec, meta))| VectorSearchResult {
                         id: id.clone(),
-                        score: cosine(&query, vec),
+                        score: wiki_core::cosine_similarity(&query, vec),
                         metadata: meta.clone(),
                     })
                     .collect()
@@ -123,6 +126,19 @@ impl VectorStore for MemVectorStore {
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         hits.truncate(top_k);
         Ok(hits)
+    }
+
+    async fn batch_upsert(
+        &self,
+        collection: &str,
+        items: &[(String, Vec<f32>, serde_json::Value)],
+    ) -> Result<()> {
+        let mut data = self.data.lock();
+        let col = data.entry(collection.to_string()).or_default();
+        for (id, vec, meta) in items {
+            col.insert(id.clone(), (vec.clone(), meta.clone()));
+        }
+        Ok(())
     }
 
     async fn delete(&self, collection: &str, id: &str) -> Result<()> {
@@ -205,8 +221,8 @@ impl OpLog for MemOpLog {
 
 #[derive(Default)]
 struct MemTextIndex {
-    // block_id -> text
-    idx: Mutex<HashMap<String, String>>,
+    // block_id -> (text, metadata)
+    idx: Mutex<HashMap<String, (String, serde_json::Value)>>,
 }
 
 #[async_trait]
@@ -215,16 +231,44 @@ impl TextIndex for MemTextIndex {
         &self,
         block_id: &str,
         text: &str,
-        _meta: serde_json::Value,
+        meta: serde_json::Value,
     ) -> Result<()> {
-        self.idx.lock().insert(block_id.to_string(), text.to_lowercase());
+        self.idx.lock().insert(block_id.to_string(), (text.to_lowercase(), meta));
         Ok(())
     }
 
     async fn search(&self, query: &TextQuery, top_k: usize) -> Result<Vec<TextHit>> {
         let idx = self.idx.lock();
+        let total_docs = idx.len().max(1) as f32;
+        // 计算 IDF（为 BM25 评分用）
+        let mut doc_freq: HashMap<String, f32> = HashMap::new();
+        for term in &query.terms {
+            let t = term.to_lowercase();
+            let df = idx.values().filter(|(text, _)| text.contains(&t)).count() as f32;
+            let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
+            doc_freq.insert(t, idf);
+        }
+
         let mut hits = Vec::new();
-        for (id, text) in idx.iter() {
+        for (id, (text, meta)) in idx.iter() {
+            let text_len = text.split_whitespace().count().max(1) as f32;
+            let avg_len = total_docs.max(1.0);
+
+            // BM25 评分：k1=1.2, b=0.75
+            let bm25_score: f32 = query
+                .terms
+                .iter()
+                .map(|term| {
+                    let t = term.to_lowercase();
+                    let idf = doc_freq.get(&t).copied().unwrap_or(0.0);
+                    let tf = text.matches(&t).count() as f32;
+                    let k1 = 1.2;
+                    let b = 0.75;
+                    idf * (tf * (k1 + 1.0))
+                        / (tf + k1 * (1.0 - b + b * text_len / avg_len))
+                })
+                .sum();
+
             let matched = match query.mode {
                 MatchMode::Exact => query.terms.iter().all(|t| text.contains(&t.to_lowercase())),
                 MatchMode::Prefix => query
@@ -232,20 +276,41 @@ impl TextIndex for MemTextIndex {
                     .iter()
                     .any(|t| text.split_whitespace().any(|w| w.starts_with(&t.to_lowercase()))),
                 MatchMode::Fuzzy => query.terms.iter().any(|t| text.contains(&t.to_lowercase())),
+                MatchMode::Phrase => query
+                    .phrase
+                    .as_ref()
+                    .map(|p| text.contains(&p.to_lowercase()))
+                    .unwrap_or(false),
+                MatchMode::Boolean => {
+                    match query.bool_op.unwrap_or(BoolOp::And) {
+                        BoolOp::And => query.terms.iter().all(|t| text.contains(&t.to_lowercase())),
+                        BoolOp::Or => query.terms.iter().any(|t| text.contains(&t.to_lowercase())),
+                        BoolOp::Not => !query.terms.iter().any(|t| text.contains(&t.to_lowercase())),
+                    }
+                }
             };
             let phrase_ok = query
                 .phrase
                 .as_ref()
                 .map(|p| text.contains(&p.to_lowercase()))
                 .unwrap_or(true);
-            if matched && phrase_ok {
+
+            // 应用 filter：查询中的 filter 字段需与索引时的 meta 匹配。
+            let filter_ok = match &query.filter {
+                Some(filter) => filter_matches(filter, meta),
+                None => true,
+            };
+
+            if matched && phrase_ok && filter_ok {
                 hits.push(TextHit {
                     block_id: id.clone(),
                     snippet: text.chars().take(80).collect(),
-                    score: 1.0,
+                    score: bm25_score,
                 });
             }
         }
+        // 按 BM25 评分降序排列。
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         hits.truncate(top_k);
         Ok(hits)
     }
@@ -437,7 +502,7 @@ impl DocVersionStore for MemVersionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiki_core::{Block, BlockContent, BlockType, SpaceId};
+    use wiki_core::{Block, BlockContent, BlockId, BlockType, Op, SpaceId, WikiSpace};
 
     fn sample_doc() -> Document {
         let root = Block::new(BlockType::Paragraph, BlockContent::text("hello world"), "a");
@@ -477,6 +542,7 @@ mod tests {
             phrase: None,
             filter: None,
             mode: MatchMode::Exact,
+            bool_op: None,
         };
         assert_eq!(storage.text_index().search(&tq, 5).await.unwrap().len(), 1);
 
@@ -514,5 +580,207 @@ mod tests {
         // restore 生成第三个版本
         vs.restore(&doc.id, &v1).await.unwrap();
         assert_eq!(vs.list_versions(&doc.id).await.unwrap().len(), 3);
+    }
+
+    /// 验证 WAL 回滚：批次中间有无效 Op 时，文档状态不变。
+    #[tokio::test]
+    async fn wal_rollback_on_invalid_op() {
+        let storage = MemoryWikiStorage::new();
+        let space = WikiSpace::new(SpaceId::default(), Arc::new(storage));
+
+        // 创建一个文档。
+        let doc = space
+            .create_doc("Test", Block::new(
+                BlockType::Paragraph,
+                BlockContent::text("root content"),
+                "tester",
+            ))
+            .await
+            .unwrap();
+
+        let root_id = doc.root.clone();
+        let initial_block_count = doc.blocks.len();
+
+        // 构造一批 Op：第一个有效，第二个无效（引用不存在的 block）。
+        let valid_block = Block::new(
+            BlockType::Paragraph,
+            BlockContent::text("valid child"),
+            "tester",
+        );
+        let ops = vec![
+            Op::InsertBlock {
+                parent: root_id.clone(),
+                after: None,
+                block: valid_block,
+            },
+            // 无效 Op：UpdateBlock 引用不存在的 block id。
+            Op::UpdateBlock {
+                id: BlockId::new(), // 新 ID，不存在于文档中
+                patch: serde_json::json!({"text": "should fail"}),
+            },
+        ];
+
+        let result = space.apply_ops(&doc.id, ops).await;
+        assert!(result.is_err(), "包含无效 Op 的批次应返回错误");
+
+        // 验证文档未被修改。
+        let reloaded = space.get_doc(&doc.id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.blocks.len(),
+            initial_block_count,
+            "回滚后 Block 数量应与初始一致"
+        );
+        assert_eq!(reloaded.version, doc.version, "文档版本不应增加");
+    }
+
+    /// 验证有效批次正常提交。
+    #[tokio::test]
+    async fn wal_commit_valid_batch() {
+        let storage = MemoryWikiStorage::new();
+        let space = WikiSpace::new(SpaceId::default(), Arc::new(storage));
+
+        let doc = space
+            .create_doc("Test", Block::new(
+                BlockType::Paragraph,
+                BlockContent::text("root content"),
+                "tester",
+            ))
+            .await
+            .unwrap();
+
+        let root_id = doc.root.clone();
+        let child = Block::new(
+            BlockType::Paragraph,
+            BlockContent::text("child"),
+            "tester",
+        );
+        let child_id = child.id.clone();
+
+        let ops = vec![Op::InsertBlock {
+            parent: root_id.clone(),
+            after: None,
+            block: child,
+        }];
+
+        let result = space.apply_ops(&doc.id, ops).await;
+        assert!(result.is_ok(), "有效批次应成功提交");
+        let updated = result.unwrap();
+        assert!(updated.block(&child_id).is_some(), "新 Block 应已添加到文档");
+        assert!(updated.version > doc.version, "版本应递增");
+    }
+
+    /// 验证撤销/重做流程。
+    #[tokio::test]
+    async fn undo_redo_roundtrip() {
+        let storage = MemoryWikiStorage::new();
+        let space = WikiSpace::new(SpaceId::default(), Arc::new(storage));
+
+        let doc = space
+            .create_doc("UndoTest", Block::new(
+                BlockType::Paragraph,
+                BlockContent::text("original"),
+                "tester",
+            ))
+            .await
+            .unwrap();
+        let original_version = doc.version;
+
+        // 执行一次修改。
+        let root_id = doc.root.clone();
+        let child = Block::new(
+            BlockType::Paragraph,
+            BlockContent::text("added child"),
+            "tester",
+        );
+        let child_id = child.id.clone();
+        let ops = vec![Op::InsertBlock {
+            parent: root_id.clone(),
+            after: None,
+            block: child,
+        }];
+        let updated = space.apply_ops(&doc.id, ops).await.unwrap();
+        assert!(updated.block(&child_id).is_some());
+        assert!(updated.version > original_version);
+
+        // 撤销。
+        let undone = space.undo(&doc.id).await.unwrap().unwrap();
+        assert!(undone.block(&child_id).is_none(), "撤销后子块应不存在");
+        assert_eq!(undone.version, original_version, "版本应回退");
+
+        // 重做。
+        let redone = space.redo(&doc.id).await.unwrap().unwrap();
+        assert!(redone.block(&child_id).is_some(), "重做后子块应恢复");
+        assert!(redone.version > original_version);
+
+        // 再次撤销确认。
+        let undone2 = space.undo(&doc.id).await.unwrap().unwrap();
+        assert!(undone2.block(&child_id).is_none());
+
+        // 无可重做时返回 None。
+        let no_redo = space.undo(&doc.id).await.unwrap();
+        assert!(no_redo.is_none(), "无可撤销内容时应返回 None");
+    }
+
+    /// 并发写入不产生数据损坏。
+    #[tokio::test]
+    async fn concurrent_writes_no_corruption() {
+        let storage = MemoryWikiStorage::new();
+        let space = Arc::new(WikiSpace::new(SpaceId::default(), Arc::new(storage)));
+
+        let doc = space
+            .create_doc("Concurrent", Block::new(
+                BlockType::Paragraph,
+                BlockContent::text("root"),
+                "tester",
+            ))
+            .await
+            .unwrap();
+        let root = doc.root.clone();
+
+        // 并发插入 N 个不同的子块。
+        let space = Arc::new(space);
+        let mut handles = vec![];
+        for i in 0..10 {
+            let s = space.clone();
+            let r = root.clone();
+            let did = doc.id.clone();
+            handles.push(tokio::spawn(async move {
+                let child = Block::new(
+                    BlockType::Paragraph,
+                    BlockContent::text(format!("concurrent-{i}")),
+                    "tester",
+                );
+                let ops = vec![Op::InsertBlock {
+                    parent: r,
+                    after: None,
+                    block: child,
+                }];
+                s.apply_ops(&did, ops).await
+            }));
+        }
+
+        let mut inserted = 0;
+        let mut errors = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(_) => inserted += 1,
+                Err(_) => errors += 1,
+            }
+        }
+
+        // 每个并发操作都处理了。
+        assert!(inserted + errors > 0);
+
+        // 重新加载文档验证完整性。
+        let reloaded = space.get_doc(&doc.id).await.unwrap().unwrap();
+        // 所有块的 parent 引用都有效。
+        for block in &reloaded.blocks {
+            if let Some(ref parent) = block.parent {
+                assert!(
+                    reloaded.block(parent).is_some(),
+                    "并发写入后块的 parent 引用无效"
+                );
+            }
+        }
     }
 }

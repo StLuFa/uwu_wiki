@@ -49,6 +49,20 @@ pub struct VectorSearchResult {
 pub trait VectorStore: Send + Sync {
     async fn upsert(&self, collection: &str, id: &str, vector: Vec<f32>, metadata: Value)
         -> Result<()>;
+
+    /// 批量 upsert。默认实现逐条调用 [`upsert`](VectorStore::upsert)，
+    /// 实现方可覆盖为高效批量写入。
+    async fn batch_upsert(
+        &self,
+        collection: &str,
+        items: &[(String, Vec<f32>, Value)],
+    ) -> Result<()> {
+        for (id, vec, meta) in items {
+            self.upsert(collection, id, vec.clone(), meta.clone()).await?;
+        }
+        Ok(())
+    }
+
     async fn search(
         &self,
         collection: &str,
@@ -89,20 +103,38 @@ pub trait OpLog: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatchMode {
+    /// 所有词条都匹配（AND 逻辑）。
     Exact,
+    /// 任意词条前缀匹配。
     Prefix,
+    /// 宽松匹配（编辑距离 / 包含）。
     Fuzzy,
+    /// 精确短语匹配。
+    Phrase,
+    /// 布尔组合（AND/OR/NOT）。
+    Boolean,
+}
+
+/// 布尔操作符（配合 `MatchMode::Boolean` 使用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BoolOp {
+    And,
+    Or,
+    Not,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextQuery {
-    /// 精确词。
+    /// 检索词条。
     pub terms: Vec<String>,
-    /// 短语精确匹配。
+    /// 短语精确匹配（`mode: Phrase` 时使用）。
     pub phrase: Option<String>,
     /// tag/status/space 过滤。
     pub filter: Option<Value>,
+    /// 匹配模式。
     pub mode: MatchMode,
+    /// 布尔操作符（`mode: Boolean` 时使用）。
+    pub bool_op: Option<BoolOp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,8 +147,26 @@ pub struct TextHit {
 #[async_trait]
 pub trait TextIndex: Send + Sync {
     async fn index_block(&self, block_id: &str, text: &str, meta: Value) -> Result<()>;
+
     async fn search(&self, query: &TextQuery, top_k: usize) -> Result<Vec<TextHit>>;
+
     async fn remove(&self, block_id: &str) -> Result<()>;
+
+    /// 批量索引。默认实现逐条调用 [`index_block`](TextIndex::index_block)。
+    async fn batch_index(&self, entries: &[(String, String, Value)]) -> Result<()> {
+        for (id, text, meta) in entries {
+            self.index_block(id, text, meta.clone()).await?;
+        }
+        Ok(())
+    }
+
+    /// 批量删除。默认实现逐条调用 [`remove`](TextIndex::remove)。
+    async fn batch_remove(&self, block_ids: &[String]) -> Result<()> {
+        for id in block_ids {
+            self.remove(id).await?;
+        }
+        Ok(())
+    }
 }
 
 // ===========================================================================

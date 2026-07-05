@@ -3,9 +3,13 @@
 //! 流程图 / 思维导图：节点/边模型 + 索引化存储 + 遍历 + 导出 + 布局。
 //! 图节点自适配为 `wiki_llm::TextUnit`，不反向依赖横切层。
 
+pub mod layout;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use wiki_llm::TextUnit;
+
+pub use layout::{force_directed_layout, layered_layout, tree_layout, LayoutResult};
 
 // ===========================================================================
 // 基础模型
@@ -48,6 +52,12 @@ pub struct GraphNode {
     /// 颜色（hex，可选）。
     pub color: Option<String>,
     pub embedding: Option<Vec<f32>>,
+    /// 子图分组名（可选，供 [`Graph::subgraph`] 过滤用）。
+    pub group: Option<String>,
+    /// 自定义图标（emoji 或 URL，可选）。
+    pub icon: Option<String>,
+    /// 自定义节点尺寸 (width, height)（可选）。
+    pub size: Option<(f32, f32)>,
 }
 
 impl GraphNode {
@@ -59,6 +69,9 @@ impl GraphNode {
             tags: Vec::new(),
             color: None,
             embedding: None,
+            group: None,
+            icon: None,
+            size: None,
         }
     }
 
@@ -286,6 +299,25 @@ impl Graph {
 
     pub fn edge_count(&self) -> usize {
         self.edges.len()
+    }
+
+    /// 提取子图：返回仅含指定分组节点的新图，及分组内节点间的边。
+    pub fn subgraph(&self, group_name: &str) -> Graph {
+        let mut g = Graph::new(format!("{}-{}", self.id, group_name));
+        g.title = Some(format!("{} / {}", self.title.as_deref().unwrap_or(&self.id), group_name));
+        for node in &self.nodes {
+            if node.group.as_deref() == Some(group_name) {
+                g.add_node(node.clone()).ok();
+            }
+        }
+        // 收集子图内节点 ID（避免借用冲突：先收集，再迭代边）。
+        let node_ids: HashSet<NodeId> = g.nodes.iter().map(|n| n.id.clone()).collect();
+        for edge in &self.edges {
+            if node_ids.contains(&edge.from) && node_ids.contains(&edge.to) {
+                g.add_edge(edge.clone()).ok();
+            }
+        }
+        g
     }
 
     /// 节点适配为领域无关 TextUnit。
@@ -550,91 +582,6 @@ impl Graph {
 }
 
 // ===========================================================================
-// 布局算法
-// ===========================================================================
-
-/// 布局结果：节点 → 2D 坐标。
-#[derive(Debug, Clone)]
-pub struct LayoutResult {
-    pub positions: HashMap<NodeId, (f32, f32)>,
-}
-
-/// 简单树形布局：从 root 出发，每层向下排列子节点。
-pub fn tree_layout(graph: &Graph, root: &NodeId) -> LayoutResult {
-    let mut positions = HashMap::new();
-    let mut visited = HashSet::new();
-    tree_layout_dfs(graph, root, 0, 0, &mut positions, &mut visited);
-    LayoutResult { positions }
-}
-
-fn tree_layout_dfs(
-    graph: &Graph,
-    node_id: &NodeId,
-    depth: usize,
-    sibling_index: usize,
-    positions: &mut HashMap<NodeId, (f32, f32)>,
-    visited: &mut HashSet<NodeId>,
-) -> f32 {
-    if !visited.insert(node_id.clone()) {
-        return sibling_index as f32;
-    }
-
-    let y = depth as f32 * 80.0;
-    let children: Vec<&Edge> = graph.edges_from(node_id);
-    let children: Vec<&NodeId> = children.iter().map(|e| &e.to).collect();
-
-    let x: f32;
-    if children.is_empty() {
-        x = sibling_index as f32 * 120.0;
-    } else {
-        let mut last_x = sibling_index as f32;
-        for (i, child) in children.iter().enumerate() {
-            last_x = tree_layout_dfs(graph, child, depth + 1, i, positions, visited);
-        }
-        // 父节点居中。
-        let first_child_x = positions.get(children[0]).map(|p| p.0).unwrap_or(0.0);
-        x = (first_child_x + last_x) / 2.0;
-    }
-
-    positions.insert(node_id.clone(), (x, y));
-    x
-}
-
-/// 分层布局：拓扑排序后按层排列。
-pub fn layered_layout(graph: &Graph) -> LayoutResult {
-    let mut positions = HashMap::new();
-
-    // 按拓扑排序分到各层。
-    let sorted = graph.topological_sort().unwrap_or_else(|_| graph.nodes.iter().collect());
-    let mut layer: HashMap<&NodeId, usize> = HashMap::new();
-
-    for node in &sorted {
-        let max_parent_layer = graph
-            .edges_to(&node.id)
-            .iter()
-            .filter_map(|e| layer.get(&&e.from))
-            .max()
-            .copied()
-            .unwrap_or(0);
-        layer.insert(&node.id, max_parent_layer + 1);
-    }
-
-    // 每层水平排列。
-    let mut layer_counts: HashMap<usize, usize> = HashMap::new();
-    for node in &sorted {
-        let l = layer[&node.id];
-        let count = layer_counts.entry(l).or_insert(0);
-        positions.insert(
-            node.id.clone(),
-            (*count as f32 * 140.0 + 20.0, l as f32 * 100.0),
-        );
-        *count += 1;
-    }
-
-    LayoutResult { positions }
-}
-
-// ===========================================================================
 // 测试
 // ===========================================================================
 
@@ -843,5 +790,57 @@ mod tests {
         let b = g.get_node(&NodeId("b".into())).unwrap();
         assert_eq!(b.in_degree(&g), 1);
         assert_eq!(b.out_degree(&g), 1);
+    }
+
+    // ---- 新功能测试 ----
+
+    #[test]
+    fn node_with_group_and_icon() {
+        let mut node = GraphNode::new("n1", NodeKind::Process, "task");
+        node.group = Some("backend".into());
+        node.icon = Some("⚙️".into());
+        node.size = Some((120.0, 60.0));
+        assert_eq!(node.group.as_deref(), Some("backend"));
+        assert_eq!(node.icon.as_deref(), Some("⚙️"));
+        assert_eq!(node.size, Some((120.0, 60.0)));
+    }
+
+    #[test]
+    fn subgraph_filters_by_group() {
+        let mut g = Graph::new("main");
+        let mut n1 = GraphNode::new("a", NodeKind::Process, "A");
+        n1.group = Some("g1".into());
+        let mut n2 = GraphNode::new("b", NodeKind::Process, "B");
+        n2.group = Some("g1".into());
+        let mut n3 = GraphNode::new("c", NodeKind::Process, "C");
+        n3.group = Some("g2".into());
+        g.add_node(n1).unwrap();
+        g.add_node(n2).unwrap();
+        g.add_node(n3).unwrap();
+        g.add_edge(Edge::new(NodeId("a".into()), NodeId("b".into()))).unwrap();
+        g.add_edge(Edge::new(NodeId("b".into()), NodeId("c".into()))).unwrap();
+
+        let sub = g.subgraph("g1");
+        assert_eq!(sub.node_count(), 2);
+        assert_eq!(sub.edge_count(), 1); // a→b，b→c 中 c 不在子图内
+    }
+
+    #[test]
+    fn force_directed_layout_covers_all_nodes() {
+        let g = sample_graph();
+        let layout = force_directed_layout(&g, 800.0, 600.0, 50);
+        assert_eq!(layout.positions.len(), 4);
+        // 所有节点应在画布范围内。
+        for pos in layout.positions.values() {
+            assert!(pos.0 >= 0.0 && pos.0 <= 800.0);
+            assert!(pos.1 >= 0.0 && pos.1 <= 600.0);
+        }
+    }
+
+    #[test]
+    fn force_directed_layout_empty_graph() {
+        let g = Graph::new("empty");
+        let layout = force_directed_layout(&g, 800.0, 600.0, 50);
+        assert!(layout.positions.is_empty());
     }
 }

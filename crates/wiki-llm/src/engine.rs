@@ -19,9 +19,9 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use wiki_collab::{PermissionFilter, RequestContext};
-use wiki_core::{DocStore, TextIndex, VectorStore};
+use wiki_core::{DocStore, TextIndex, VectorStore, WikiConfig};
 
-use crate::{rag, LlmCapability, LlmClient, LlmOpts, QaAnswer, TextUnit};
+use crate::{rag, retry, LlmCapability, LlmClient, LlmOpts, QaAnswer, TextUnit};
 
 // ===========================================================================
 // DefaultLlmEngine
@@ -29,7 +29,7 @@ use crate::{rag, LlmCapability, LlmClient, LlmOpts, QaAnswer, TextUnit};
 
 /// `LlmCapability` 的默认实现。
 ///
-/// 构造时注入 5 个端口；`search` / `qa` 路径内置权限过滤。
+/// 构造时注入 5 个端口 + 配置；`search` / `qa` 路径内置权限过滤。
 pub struct DefaultLlmEngine {
     llm: Arc<dyn LlmClient>,
     vector: Arc<dyn VectorStore>,
@@ -37,12 +37,14 @@ pub struct DefaultLlmEngine {
     #[allow(dead_code)]
     docs: Arc<dyn DocStore>,
     permission: Arc<dyn PermissionFilter>,
+    config: Arc<WikiConfig>,
 }
 
 impl DefaultLlmEngine {
     /// 构造完整引擎。
     ///
     /// 若不需要权限过滤（测试/单用户），可传入 [`AllowAllPermissionFilter`](crate::mock::AllowAllPermissionFilter)。
+    /// 若未提供 config，使用 [`WikiConfig::default()`]。
     pub fn new(
         llm: Arc<dyn LlmClient>,
         vector: Arc<dyn VectorStore>,
@@ -56,6 +58,26 @@ impl DefaultLlmEngine {
             text,
             docs,
             permission,
+            config: Arc::new(WikiConfig::default()),
+        }
+    }
+
+    /// 构造完整引擎（带自定义配置）。
+    pub fn with_config(
+        llm: Arc<dyn LlmClient>,
+        vector: Arc<dyn VectorStore>,
+        text: Arc<dyn TextIndex>,
+        docs: Arc<dyn DocStore>,
+        permission: Arc<dyn PermissionFilter>,
+        config: Arc<WikiConfig>,
+    ) -> Self {
+        Self {
+            llm,
+            vector,
+            text,
+            docs,
+            permission,
+            config,
         }
     }
 
@@ -72,6 +94,7 @@ impl DefaultLlmEngine {
             text,
             docs: Arc::new(NoopDocStore),
             permission,
+            config: Arc::new(WikiConfig::default()),
         }
     }
 
@@ -93,30 +116,36 @@ impl LlmCapability for DefaultLlmEngine {
             return Ok(vec![]);
         }
         let texts: Vec<String> = units.iter().map(|u| u.text.clone()).collect();
-        self.llm.embed(&texts).await
+        retry::with_retry(&self.config.retry, "embed", || async {
+            self.llm.embed(&texts).await
+        })
+        .await
     }
 
     // ---- search ----
 
+    #[tracing::instrument(skip(self), fields(query, top_k))]
     async fn search(&self, query: &str, top_k: usize) -> crate::Result<Vec<(TextUnit, f32)>> {
-        // 1. 生成查询 embedding。
-        let query_vecs = self
-            .llm
-            .embed(&[query.to_string()])
-            .await?;
+        // 1. 生成查询 embedding（带重试）。
+        let query_vecs = retry::with_retry(&self.config.retry, "embed(search)", || async {
+            self.llm.embed(&[query.to_string()]).await
+        })
+        .await?;
         let query_vec = query_vecs
             .into_iter()
             .next()
-            .unwrap_or_else(|| vec![0.0; 4]);
+            .unwrap_or_else(|| vec![0.0; self.config.rag.fallback_embedding_dim]);
 
         // 2. 混合检索（语义 + 全文）。
         let tq = self.text_query(query);
+        let overfetch = top_k * self.config.rag.search_overfetch_multiplier;
         let hits = rag::hybrid_search(
             self.vector.as_ref(),
             self.text.as_ref(),
             query_vec,
             &tq,
-            top_k * 2, // 多召回，留给权限过滤余量
+            overfetch,
+            self.config.rag.rrf_k,
         )
         .await?;
 
@@ -152,16 +181,20 @@ impl LlmCapability for DefaultLlmEngine {
             "你是内容补全助手。基于以下文本续写：\n\n完整文本: {}\n待补全位置: {}| ←\n\n请直接从光标位置续写，不要重复已有内容。",
             unit.text, partial
         );
-        self.llm
-            .complete(&prompt, &LlmOpts {
-                temperature: Some(0.3),
-                ..Default::default()
-            })
-            .await
+        retry::with_retry(&self.config.retry, "complete(complete)", || async {
+            self.llm
+                .complete(&prompt, &LlmOpts {
+                    temperature: Some(self.config.rag.complete_temperature),
+                    ..Default::default()
+                })
+                .await
+        })
+        .await
     }
 
     // ---- qa ----
 
+    #[tracing::instrument(skip(self), fields(question))]
     async fn qa(
         &self,
         question: &str,
@@ -175,7 +208,7 @@ impl LlmCapability for DefaultLlmEngine {
         let query_vec = query_vecs
             .into_iter()
             .next()
-            .unwrap_or_else(|| vec![0.0; 4]);
+            .unwrap_or_else(|| vec![0.0; self.config.rag.fallback_embedding_dim]);
 
         // 2. 混合检索。
         let tq = self.text_query(question);
@@ -184,7 +217,8 @@ impl LlmCapability for DefaultLlmEngine {
             self.text.as_ref(),
             query_vec,
             &tq,
-            8, // QA 检索 top-8
+            self.config.rag.qa_top_k,
+            self.config.rag.rrf_k,
         )
         .await?;
 
@@ -211,15 +245,17 @@ impl LlmCapability for DefaultLlmEngine {
         let context = rag::build_rag_context(&filtered);
         let prompt = rag::build_qa_prompt(question, &context);
 
-        // 5. LLM 推理。
-        let raw_answer = self
-            .llm
-            .complete(&prompt, &LlmOpts {
-                temperature: Some(0.1),
-                max_tokens: Some(1024),
-                ..Default::default()
-            })
-            .await?;
+        // 5. LLM 推理（带重试）。
+        let raw_answer = retry::with_retry(&self.config.retry, "complete(qa)", || async {
+            self.llm
+                .complete(&prompt, &LlmOpts {
+                    temperature: Some(self.config.rag.qa_temperature),
+                    max_tokens: Some(self.config.rag.qa_max_tokens),
+                    ..Default::default()
+                })
+                .await
+        })
+        .await?;
 
         // 6. 提取引用。
         let citations = rag::extract_citations(&raw_answer);
@@ -235,13 +271,16 @@ impl LlmCapability for DefaultLlmEngine {
             return Ok("(无内容)".to_string());
         }
         let prompt = rag::build_summarize_prompt(units);
-        self.llm
-            .complete(&prompt, &LlmOpts {
-                temperature: Some(0.2),
-                max_tokens: Some(512),
-                ..Default::default()
-            })
-            .await
+        retry::with_retry(&self.config.retry, "complete(summarize)", || async {
+            self.llm
+                .complete(&prompt, &LlmOpts {
+                    temperature: Some(self.config.rag.summarize_temperature),
+                    max_tokens: Some(self.config.rag.summarize_max_tokens),
+                    ..Default::default()
+                })
+                .await
+        })
+        .await
     }
 }
 
@@ -259,22 +298,24 @@ impl DefaultLlmEngine {
         query: &str,
         top_k: usize,
     ) -> crate::Result<Vec<(TextUnit, f32)>> {
-        let query_vecs = self
-            .llm
-            .embed(&[query.to_string()])
-            .await?;
+        let query_vecs = retry::with_retry(&self.config.retry, "embed(search_with_perm)", || async {
+            self.llm.embed(&[query.to_string()]).await
+        })
+        .await?;
         let query_vec = query_vecs
             .into_iter()
             .next()
-            .unwrap_or_else(|| vec![0.0; 4]);
+            .unwrap_or_else(|| vec![0.0; self.config.rag.fallback_embedding_dim]);
 
         let tq = self.text_query(query);
+        let overfetch = top_k * self.config.rag.search_overfetch_multiplier;
         let hits = rag::hybrid_search(
             self.vector.as_ref(),
             self.text.as_ref(),
             query_vec,
             &tq,
-            top_k * 2,
+            overfetch,
+            self.config.rag.rrf_k,
         )
         .await?;
 
@@ -300,14 +341,14 @@ impl DefaultLlmEngine {
         ctx: &RequestContext,
         question: &str,
     ) -> crate::Result<QaAnswer> {
-        let query_vecs = self
-            .llm
-            .embed(&[question.to_string()])
-            .await?;
+        let query_vecs = retry::with_retry(&self.config.retry, "embed(qa_with_perm)", || async {
+            self.llm.embed(&[question.to_string()]).await
+        })
+        .await?;
         let query_vec = query_vecs
             .into_iter()
             .next()
-            .unwrap_or_else(|| vec![0.0; 4]);
+            .unwrap_or_else(|| vec![0.0; self.config.rag.fallback_embedding_dim]);
 
         let tq = self.text_query(question);
         let hits = rag::hybrid_search(
@@ -315,7 +356,8 @@ impl DefaultLlmEngine {
             self.text.as_ref(),
             query_vec,
             &tq,
-            8,
+            self.config.rag.qa_top_k,
+            self.config.rag.rrf_k,
         )
         .await?;
 
@@ -333,14 +375,16 @@ impl DefaultLlmEngine {
         let context = rag::build_rag_context(&filtered);
         let prompt = rag::build_qa_prompt(question, &context);
 
-        let raw_answer = self
-            .llm
-            .complete(&prompt, &LlmOpts {
-                temperature: Some(0.1),
-                max_tokens: Some(1024),
-                ..Default::default()
-            })
-            .await?;
+        let raw_answer = retry::with_retry(&self.config.retry, "complete(qa_with_perm)", || async {
+            self.llm
+                .complete(&prompt, &LlmOpts {
+                    temperature: Some(self.config.rag.qa_temperature),
+                    max_tokens: Some(self.config.rag.qa_max_tokens),
+                    ..Default::default()
+                })
+                .await
+        })
+        .await?;
 
         let citations = rag::extract_citations(&raw_answer);
         let answer = strip_citation_line(&raw_answer);

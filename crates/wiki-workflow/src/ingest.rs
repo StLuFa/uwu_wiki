@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use wiki_core::{Block, BlockContent, BlockType, DocId, Op, Result, WikiSpace};
+use wiki_core::{Block, BlockContent, BlockType, DocId, Op, Result, WikiConfig, WikiSpace};
 use wiki_llm::{LlmCapability, QaAnswer};
 
 // ===========================================================================
@@ -123,14 +123,28 @@ enum UpdateAction {
 pub struct IngestPipeline {
     llm: Arc<dyn LlmCapability>,
     space: Arc<WikiSpace>,
+    config: Arc<WikiConfig>,
 }
 
 impl IngestPipeline {
     pub fn new(llm: Arc<dyn LlmCapability>, space: Arc<WikiSpace>) -> Self {
-        Self { llm, space }
+        Self {
+            llm,
+            space,
+            config: Arc::new(WikiConfig::default()),
+        }
+    }
+
+    pub fn with_config(
+        llm: Arc<dyn LlmCapability>,
+        space: Arc<WikiSpace>,
+        config: Arc<WikiConfig>,
+    ) -> Self {
+        Self { llm, space, config }
     }
 
     /// 执行完整 Ingest 流程。
+    #[tracing::instrument(skip(self, source))]
     pub async fn run(&self, source: &IngestSource) -> Result<IngestResult> {
         // 1. 分析原料：提取实体/概念/声明。
         let analysis = self.analyze_source(source).await?;
@@ -195,7 +209,7 @@ impl IngestPipeline {
             entities: vec![],
             concepts: vec![],
             claims: vec![],
-            summary: source.content.chars().take(200).collect(),
+            summary: source.content.chars().take(self.config.ingest.fallback_summary_max_chars).collect(),
         }))
     }
 
@@ -208,12 +222,12 @@ impl IngestPipeline {
             .entities
             .iter()
             .chain(analysis.concepts.iter())
-            .take(10) // 限制搜索数量
+            .take(self.config.ingest.search_limit)
             .cloned()
             .collect();
 
         for q in &queries {
-            let hits = self.llm.search(q, 3).await?;
+            let hits = self.llm.search(q, self.config.ingest.per_query_top_k).await?;
             for (unit, _score) in hits {
                 // TextUnit.path 可能包含 doc_id（若 indexing 时写入）。
                 let doc_id = unit
@@ -361,7 +375,7 @@ impl IngestPipeline {
         let title = source
             .title
             .clone()
-            .unwrap_or_else(|| format!("Ingest: {}", &analysis.summary.chars().take(40).collect::<String>()));
+            .unwrap_or_else(|| format!("Ingest: {}", &analysis.summary.chars().take(self.config.ingest.summary_title_max_chars).collect::<String>()));
 
         let meta = if let Some(ref url) = source.source_url {
             format!("\n\n> 来源: {url}")
