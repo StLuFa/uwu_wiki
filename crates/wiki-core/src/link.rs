@@ -125,3 +125,36 @@ mod tests {
         assert_eq!(links[1].to, LinkTarget::Broken("Missing".into()));
     }
 }
+
+// =============================================================================
+// CrossReference — 跨域引用
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossReference {
+    pub from_doc: crate::doc::DocId,
+    pub from_block: Option<crate::block::BlockId>,
+    pub to_space: Option<crate::doc::SpaceId>,
+    pub to_doc: Option<crate::doc::DocId>,
+    pub to_anchor: Option<String>,
+    pub display_text: Option<String>,
+    pub is_external: bool,
+    pub is_broken: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl CrossReference {
+    pub fn new(from_doc: crate::doc::DocId, link: &WikiLink) -> Self {
+        Self {
+            from_doc,
+            from_block: Some(link.from.clone()),
+            to_space: None,
+            to_doc: None,
+            to_anchor: None,
+            display_text: Some(link.anchor_text.clone()),
+            is_external: false,
+            is_broken: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
+}

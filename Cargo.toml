@@ -21,6 +21,10 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros"] }
 parking_lot = "0.12"
+tracing = "0.1"
+markdown = "1"
+rand = "0.9"
+uwu-crdt = { git = "https://github.com/StLuFa/uwu-crdt.git" }

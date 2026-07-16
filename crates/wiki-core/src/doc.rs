@@ -1,420 +1,305 @@
-//! Document 模型 + Op 操作枚举。
+//! Document 模型 — Markdown frontmatter + raw_markdown 真值源 + L0/L1/L2 三层编码。
 
-use crate::block::{Block, BlockId};
+use crate::block::{self, Block, BlockId, CustomBlockType};
 use crate::error::{Result, WikiError};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// 文档唯一标识。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DocId(pub String);
+impl DocId { pub fn new() -> Self { Self(Uuid::now_v7().to_string()) } }
+impl Default for DocId { fn default() -> Self { Self::new() } }
+impl std::fmt::Display for DocId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) } }
 
-impl DocId {
-    pub fn new() -> Self {
-        Self(Uuid::now_v7().to_string())
-    }
-}
-
-impl Default for DocId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for DocId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// 空间（多租户/多知识库隔离单元）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SpaceId(pub String);
+pub struct SpaceId { pub library: String, pub wiki: String }
+impl SpaceId {
+    pub fn new(library: impl Into<String>, wiki: impl Into<String>) -> Self { Self { library: library.into(), wiki: wiki.into() } }
+}
+impl Default for SpaceId { fn default() -> Self { Self { library: "default".into(), wiki: "default".into() } } }
+impl std::fmt::Display for SpaceId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}/{}", self.library, self.wiki) } }
 
-impl Default for SpaceId {
-    fn default() -> Self {
-        Self("default".into())
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentType {
+    Article, SmartTable, Workflow, Flowchart, Mindmap, Audio, Video, Artwork, Playlist,
+}
+impl ContentType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Article => "article", Self::SmartTable => "smart_table", Self::Workflow => "workflow",
+            Self::Flowchart => "flowchart", Self::Mindmap => "mindmap", Self::Audio => "audio",
+            Self::Video => "video", Self::Artwork => "artwork", Self::Playlist => "playlist",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "article" => Some(Self::Article), "smart_table" => Some(Self::SmartTable), "workflow" => Some(Self::Workflow),
+            "flowchart" => Some(Self::Flowchart), "mindmap" => Some(Self::Mindmap), "audio" => Some(Self::Audio),
+            "video" => Some(Self::Video), "artwork" => Some(Self::Artwork), "playlist" => Some(Self::Playlist),
+            _ => None,
+        }
     }
 }
 
-/// 结构化文档 —— Block 树。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Document {
-    pub id: DocId,
-    pub title: String,
-    pub root: BlockId,
-    pub version: u64,
-    pub space_id: SpaceId,
-    pub tags: Vec<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentStatus { Active, Frozen, Hidden, Archived }
+impl DocumentStatus {
+    pub fn is_readable(&self) -> bool { matches!(self, Self::Active | Self::Frozen) }
+    pub fn is_writable(&self) -> bool { matches!(self, Self::Active) }
+    pub fn is_searchable(&self) -> bool { matches!(self, Self::Active | Self::Frozen) }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s { "active" => Some(Self::Active), "frozen" => Some(Self::Frozen), "hidden" => Some(Self::Hidden), "archived" => Some(Self::Archived), _ => None }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self { Self::Active => "active", Self::Frozen => "frozen", Self::Hidden => "hidden", Self::Archived => "archived" }
+    }
+}
+
+// =============================================================================
+// Frontmatter
+// =============================================================================
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Frontmatter {
+    pub title: Option<String>,
+    pub content_type: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub status: Option<String>,
+    pub path: Option<String>,
+    pub author: Option<String>,
     pub icon: Option<String>,
     pub cover: Option<String>,
-    /// 文档内全部 Block（以 `root` 为树根）。
-    pub blocks: Vec<Block>,
+}
+
+pub fn parse_frontmatter(raw: &str) -> (Frontmatter, String) {
+    let trimmed = raw.trim_start();
+    if !trimmed.starts_with("---\n") && !trimmed.starts_with("---\r\n") {
+        let title = raw.lines().find(|l| l.starts_with('#')).map(|l| l.trim_start_matches('#').trim().to_string());
+        return (Frontmatter { title, ..Default::default() }, raw.to_string());
+    }
+    let after_first = &trimmed[3..].trim_start();
+    if let Some(end_idx) = after_first.find("\n---") {
+        let yaml_str = &after_first[..end_idx];
+        let body = after_first[end_idx + 4..].trim_start().to_string();
+        let fm: Frontmatter = serde_yaml::from_str(yaml_str).unwrap_or_default();
+        (fm, body)
+    } else {
+        (Frontmatter::default(), raw.to_string())
+    }
+}
+
+// =============================================================================
+// DerivationChain
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivationChain {
+    pub l2_hash: String,
+    pub l1_rule: Option<DerivationRule>,
+    pub l0_rule: Option<DerivationRule>,
+    pub last_derived: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DerivationRule { Llm { prompt_template: String, model: String }, Extractive { algorithm: String }, Manual }
+
+impl DerivationChain {
+    pub fn new(l2_content: &str) -> Self {
+        Self { l2_hash: blake3::hash(l2_content.as_bytes()).to_hex().to_string(), l1_rule: None, l0_rule: None, last_derived: Utc::now() }
+    }
+    pub fn is_stale(&self, current_l2: &str) -> bool {
+        blake3::hash(current_l2.as_bytes()).to_hex().to_string() != self.l2_hash
+    }
+    pub fn set_l1(&mut self, rule: DerivationRule) { self.l1_rule = Some(rule); self.last_derived = Utc::now(); }
+    pub fn set_l0(&mut self, rule: DerivationRule) { self.l0_rule = Some(rule); self.last_derived = Utc::now(); }
+}
+
+// =============================================================================
+// Document
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Document {
+    pub id: DocId, pub title: String, pub space_id: SpaceId,
+    pub content_type: ContentType, pub status: DocumentStatus, pub path: Option<String>,
+    pub version: u64, pub tags: Vec<String>, pub icon: Option<String>, pub cover: Option<String>,
+    pub author: String, pub created_at: DateTime<Utc>, pub updated_at: DateTime<Utc>,
+    pub raw_markdown: String, pub blocks: Vec<Block>,
+    pub summary: Option<String>, pub overview: Option<String>,
+    pub derivation: Option<DerivationChain>,
 }
 
 impl Document {
-    pub fn new(title: impl Into<String>, root: Block, space_id: SpaceId) -> Self {
-        let root_id = root.id.clone();
-        Self {
-            id: DocId::new(),
-            title: title.into(),
-            root: root_id,
-            version: 0,
-            space_id,
-            tags: Vec::new(),
-            icon: None,
-            cover: None,
-            blocks: vec![root],
-        }
+    pub fn parse(raw: impl Into<String>, space_id: SpaceId) -> Result<Self> {
+        let raw: String = raw.into();
+        let (fm, body) = parse_frontmatter(&raw);
+        let content_type = fm.content_type.as_deref().and_then(ContentType::from_str).unwrap_or(ContentType::Article);
+        let status = fm.status.as_deref().and_then(DocumentStatus::from_str).unwrap_or(DocumentStatus::Active);
+        let blocks = parse_markdown_to_blocks(&body)?;
+        let deriv = DerivationChain::new(&body);
+        let now = Utc::now();
+        Ok(Self {
+            id: DocId::new(), space_id, title: fm.title.unwrap_or_else(|| "Untitled".into()),
+            content_type, status, path: fm.path, version: 0,
+            tags: fm.tags.unwrap_or_default(), icon: fm.icon, cover: fm.cover,
+            author: fm.author.unwrap_or_else(|| "unknown".into()),
+            created_at: now, updated_at: now,
+            raw_markdown: raw, blocks,
+            summary: None, overview: None,
+            derivation: Some(deriv),
+        })
     }
 
-    pub fn block(&self, id: &BlockId) -> Option<&Block> {
-        self.blocks.iter().find(|b| &b.id == id)
+    pub fn new(title: impl Into<String>, content_type: ContentType, raw_markdown: impl Into<String>, space_id: SpaceId, author: impl Into<String>) -> Result<Self> {
+        let raw: String = raw_markdown.into();
+        let blocks = parse_markdown_to_blocks(&raw)?;
+        let deriv = DerivationChain::new(&raw);
+        let now = Utc::now();
+        Ok(Self {
+            id: DocId::new(), title: title.into(), space_id, content_type,
+            status: DocumentStatus::Active, path: None, version: 0,
+            tags: Vec::new(), icon: None, cover: None, author: author.into(),
+            created_at: now, updated_at: now,
+            raw_markdown: raw, blocks,
+            summary: None, overview: None,
+            derivation: Some(deriv),
+        })
     }
 
-    pub fn block_mut(&mut self, id: &BlockId) -> Option<&mut Block> {
-        self.blocks.iter_mut().find(|b| &b.id == id)
-    }
-
-    /// 直接子块（按 `children` 顺序）。
-    pub fn children(&self, parent: &BlockId) -> Vec<&Block> {
-        match self.block(parent) {
-            Some(p) => p
-                .children
-                .iter()
-                .filter_map(|cid| self.block(cid))
-                .collect(),
-            None => Vec::new(),
-        }
-    }
-
-    /// 前序遍历子树（含 `root`），返回 BlockId 顺序。
-    pub fn descendants(&self, root: &BlockId) -> Vec<BlockId> {
-        let mut out = Vec::new();
-        self.walk(root, &mut |b| out.push(b.id.clone()));
+    pub fn to_markdown(&self) -> String {
+        let mut out = String::new();
+        out.push_str("---\n");
+        out.push_str(&format!("title: {}\n", self.title));
+        out.push_str(&format!("content_type: {}\n", self.content_type.as_str()));
+        if !self.tags.is_empty() { out.push_str(&format!("tags: [{}]\n", self.tags.join(", "))); }
+        out.push_str(&format!("status: {}\n", self.status.as_str()));
+        if let Some(ref p) = self.path { out.push_str(&format!("path: {}\n", p)); }
+        out.push_str(&format!("author: {}\n", self.author));
+        out.push_str(&format!("created_at: {}\n", self.created_at.to_rfc3339()));
+        out.push_str("---\n\n");
+        for b in &self.blocks { out.push_str(&b.to_diffable_text()); }
         out
     }
 
-    /// 最后一个子块 ID（InsertBlock after 用）。
-    pub fn last_child(&self, parent: &BlockId) -> Option<BlockId> {
-        self.block(parent)
-            .and_then(|p| p.children.last().cloned())
+    pub fn reparse(&mut self) -> Result<()> {
+        let (_, body) = parse_frontmatter(&self.raw_markdown);
+        self.blocks = parse_markdown_to_blocks(&body)?;
+        self.updated_at = Utc::now();
+        Ok(())
     }
 
-    /// 文档的最后更新时间（取所有 Block 中最新的 `updated_at`）。
-    pub fn updated_at(&self) -> chrono::DateTime<chrono::Utc> {
-        self.blocks
-            .iter()
-            .map(|b| b.meta.updated_at)
-            .max()
-            .unwrap_or_else(chrono::Utc::now)
+    pub fn block(&self, id: &BlockId) -> Option<&Block> { block::find_block(&self.blocks, id) }
+    pub fn block_mut(&mut self, id: &BlockId) -> Option<&mut Block> { block::find_block_mut(&mut self.blocks, id) }
+    pub fn children_of(&self, parent: &BlockId) -> Vec<&Block> { block::children_of(&self.blocks, parent) }
+    pub fn descendants(&self, root: &BlockId) -> Vec<BlockId> { block::descendants(&self.blocks, root) }
+
+    pub fn body_owned(&self) -> String {
+        let raw = self.raw_markdown.clone();
+        let (_, body) = parse_frontmatter(&raw);
+        body
     }
 
-    /// 前序遍历子树（含 `root`），对每个 Block 调用 `f`。
+    pub fn set_summary(&mut self, text: String, rule: DerivationRule) {
+        self.summary = Some(text);
+        if let Some(ref mut d) = self.derivation { d.set_l0(rule); }
+    }
+    pub fn set_overview(&mut self, text: String, rule: DerivationRule) {
+        self.overview = Some(text);
+        if let Some(ref mut d) = self.derivation { d.set_l1(rule); }
+    }
+    pub fn is_derivation_stale(&self) -> bool {
+        let body = self.body_owned();
+        self.derivation.as_ref().map_or(true, |d| d.is_stale(&body))
+    }
+
     pub fn walk(&self, root: &BlockId, f: &mut impl FnMut(&Block)) {
-        if let Some(b) = self.block(root) {
-            f(b);
-            for child in b.children.clone() {
-                self.walk(&child, f);
-            }
-        }
-    }
-
-    /// 该块是否为 `ancestor` 的后代（用于 Move 防环）。
-    fn is_descendant_of(&self, node: &BlockId, ancestor: &BlockId) -> bool {
-        if node == ancestor {
-            return true;
-        }
-        match self.block(ancestor) {
-            Some(a) => a.children.iter().any(|c| self.is_descendant_of(node, c)),
-            None => false,
-        }
-    }
-
-    /// 在 `parent.children` 中把 `child` 放到 `after` 之后（`after=None` 放最前）。
-    fn place_child(&mut self, parent: &BlockId, child: &BlockId, after: Option<&BlockId>) -> Result<()> {
-        let p = self
-            .block_mut(parent)
-            .ok_or_else(|| WikiError::NotFound(format!("parent block {parent}")))?;
-        p.children.retain(|c| c != child);
-        let pos = match after {
-            None => 0,
-            Some(a) => p
-                .children
-                .iter()
-                .position(|c| c == a)
-                .map(|i| i + 1)
-                .ok_or_else(|| WikiError::Invalid(format!("after block {a} not under parent")))?,
-        };
-        p.children.insert(pos, child.clone());
-        Ok(())
-    }
-
-    /// 应用一个 [`Op`]，就地修改文档树并推进版本。
-    ///
-    /// 这是 wiki-core 的写入真相：CRDT 合并后由宿主回放 Op 得到相同状态。
-    pub fn apply(&mut self, op: Op) -> Result<()> {
-        match op {
-            Op::InsertBlock { parent, after, block } => {
-                if self.block(&parent).is_none() {
-                    return Err(WikiError::NotFound(format!("parent block {parent}")));
-                }
-                if self.block(&block.id).is_some() {
-                    return Err(WikiError::Invalid(format!("block {} already exists", block.id)));
-                }
-                let mut block = block;
-                block.parent = Some(parent.clone());
-                let child_id = block.id.clone();
-                self.blocks.push(block);
-                self.place_child(&parent, &child_id, after.as_ref())?;
-            }
-            Op::UpdateBlock { id, patch } => {
-                let block = self
-                    .block_mut(&id)
-                    .ok_or_else(|| WikiError::NotFound(format!("block {id}")))?;
-                merge_content(&mut block.content.0, &patch);
-                block.bump_version();
-            }
-            Op::DeleteBlock { id } => {
-                if id == self.root {
-                    return Err(WikiError::Invalid("cannot delete root block".into()));
-                }
-                if self.block(&id).is_none() {
-                    return Err(WikiError::NotFound(format!("block {id}")));
-                }
-                // 收集整棵子树后统一删除。
-                let to_remove = self.descendants(&id);
-                if let Some(parent_id) = self.block(&id).and_then(|b| b.parent.clone())
-                    && let Some(p) = self.block_mut(&parent_id)
-                {
-                    p.children.retain(|c| c != &id);
-                }
-                self.blocks.retain(|b| !to_remove.contains(&b.id));
-            }
-            Op::MoveBlock { id, new_parent, after } => {
-                if id == self.root {
-                    return Err(WikiError::Invalid("cannot move root block".into()));
-                }
-                if self.block(&id).is_none() {
-                    return Err(WikiError::NotFound(format!("block {id}")));
-                }
-                if self.block(&new_parent).is_none() {
-                    return Err(WikiError::NotFound(format!("new parent {new_parent}")));
-                }
-                // 防止把节点移进自己的子树造成环。
-                if self.is_descendant_of(&new_parent, &id) {
-                    return Err(WikiError::Invalid(
-                        "cannot move a block into its own subtree".into(),
-                    ));
-                }
-                // 从旧父摘除。
-                if let Some(old_parent) = self.block(&id).and_then(|b| b.parent.clone())
-                    && let Some(p) = self.block_mut(&old_parent)
-                {
-                    p.children.retain(|c| c != &id);
-                }
-                if let Some(b) = self.block_mut(&id) {
-                    b.parent = Some(new_parent.clone());
-                }
-                self.place_child(&new_parent, &id, after.as_ref())?;
-            }
-            Op::UpdateDocMeta { doc_id, patch } => {
-                if doc_id != self.id {
-                    return Err(WikiError::Invalid(format!(
-                        "doc meta op targets {doc_id}, not {}",
-                        self.id
-                    )));
-                }
-                apply_doc_meta(self, &patch);
-            }
-        }
-        self.version += 1;
-        Ok(())
+        if let Some(b) = self.block(root) { f(b); for child in b.children().to_vec() { self.walk(&child, f); } }
     }
 }
 
-/// 顶层字段浅合并到 Block 内容 JSON。
-fn merge_content(target: &mut serde_json::Value, patch: &serde_json::Value) {
-    match (target, patch) {
-        (serde_json::Value::Object(t), serde_json::Value::Object(p)) => {
-            for (k, v) in p {
-                t.insert(k.clone(), v.clone());
-            }
-        }
-        (t, p) => *t = p.clone(),
-    }
-}
+// =============================================================================
+// Op
+// =============================================================================
 
-/// 应用文档级 meta patch（title / tags / icon / cover）。
-fn apply_doc_meta(doc: &mut Document, patch: &serde_json::Value) {
-    if let Some(t) = patch.get("title").and_then(|v| v.as_str()) {
-        doc.title = t.to_string();
-    }
-    if let Some(icon) = patch.get("icon").and_then(|v| v.as_str()) {
-        doc.icon = Some(icon.to_string());
-    }
-    if let Some(cover) = patch.get("cover").and_then(|v| v.as_str()) {
-        doc.cover = Some(cover.to_string());
-    }
-    if let Some(tags) = patch.get("tags").and_then(|v| v.as_array()) {
-        doc.tags = tags
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-    }
-}
-
-/// 写操作 —— CRDT 合并输入、事件消息体、审计日志三合一。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Op {
-    InsertBlock {
-        parent: BlockId,
-        after: Option<BlockId>,
-        block: Block,
-    },
-    UpdateBlock {
-        id: BlockId,
-        patch: serde_json::Value,
-    },
-    DeleteBlock {
-        id: BlockId,
-    },
-    MoveBlock {
-        id: BlockId,
-        new_parent: BlockId,
-        after: Option<BlockId>,
-    },
-    UpdateDocMeta {
-        doc_id: DocId,
-        patch: serde_json::Value,
-    },
+    TextUpdate { patch: String, base_version: u64 },
+    BlockUpdate { block_id: BlockId, patch: serde_json::Value },
+    InsertBlock { after: Option<BlockId>, block: Block },
+    DeleteBlock { block_id: BlockId },
+    MoveBlock { id: BlockId, new_parent: BlockId, after: Option<BlockId> },
+    UpdateMeta { patch: serde_json::Value },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::block::{BlockContent, BlockType};
+// =============================================================================
+// Markdown → Block 解析
+// =============================================================================
 
-    fn para(text: &str) -> Block {
-        Block::new(BlockType::Paragraph, BlockContent::text(text), "tester")
+pub fn parse_markdown_to_blocks(md: &str) -> Result<Vec<Block>> {
+    let node = markdown::to_mdast(md, &markdown::ParseOptions::gfm())
+        .map_err(|e| WikiError::Invalid(format!("markdown parse: {e}")))?;
+    let ast = format!("{:?}", node);
+    let ast_value: serde_json::Value = serde_json::from_str(&ast)
+        .map_err(|e| WikiError::Invalid(format!("serialize ast: {e}")))?;
+    let mut blocks = Vec::new();
+    flatten_ast_to_blocks(&ast_value, md, &mut blocks, "system")?;
+    Ok(blocks)
+}
+
+fn flatten_ast_to_blocks(node: &serde_json::Value, raw_source: &str, out: &mut Vec<Block>, author: &str) -> Result<()> {
+    let nt = node.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+    match nt {
+        "html" => {
+            let hv = node.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some((ty, data)) = parse_custom_component(hv) {
+                out.push(Block::custom(ty, data, hv, author));
+            } else {
+                out.push(Block::markdown(node.clone(), "html", extract_raw_text(raw_source, node), author));
+            }
+        }
+        "heading" | "paragraph" | "code" | "list" | "listItem" | "blockquote" | "thematicBreak"
+        | "table" | "tableRow" | "tableCell" | "image" | "link" | "emphasis" | "strong"
+        | "inlineCode" | "text" | "break" | "delete" | "definition" | "footnoteDefinition" | "footnoteReference" => {
+            out.push(Block::markdown(node.clone(), nt, extract_raw_text(raw_source, node), author));
+        }
+        _ => {}
     }
-
-    fn doc_with_root() -> (Document, BlockId) {
-        let root = para("root");
-        let root_id = root.id.clone();
-        (Document::new("T", root, SpaceId::default()), root_id)
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for child in children { flatten_ast_to_blocks(child, raw_source, out, author)?; }
     }
+    Ok(())
+}
 
-    #[test]
-    fn insert_block_appends_child() {
-        let (mut doc, root) = doc_with_root();
-        let child = para("c1");
-        let cid = child.id.clone();
-        doc.apply(Op::InsertBlock { parent: root.clone(), after: None, block: child }).unwrap();
-        assert_eq!(doc.children(&root).len(), 1);
-        assert_eq!(doc.block(&cid).unwrap().parent, Some(root));
+fn extract_raw_text(source: &str, node: &serde_json::Value) -> String {
+    if let (Some(s), Some(e)) = (
+        node.get("position").and_then(|p| p.get("start").and_then(|x| x.get("offset"))).and_then(|v| v.as_u64()),
+        node.get("position").and_then(|p| p.get("end").and_then(|x| x.get("offset"))).and_then(|v| v.as_u64()),
+    ) {
+        if s < e && (e as usize) <= source.len() { return source[s as usize..e as usize].to_string(); }
     }
+    String::new()
+}
 
-    #[test]
-    fn insert_after_orders_siblings() {
-        let (mut doc, root) = doc_with_root();
-        let a = para("a");
-        let b = para("b");
-        let (aid, bid) = (a.id.clone(), b.id.clone());
-        doc.apply(Op::InsertBlock { parent: root.clone(), after: None, block: a }).unwrap();
-        doc.apply(Op::InsertBlock { parent: root.clone(), after: Some(aid.clone()), block: b }).unwrap();
-        let order: Vec<_> = doc.children(&root).iter().map(|b| b.id.clone()).collect();
-        assert_eq!(order, vec![aid, bid]);
+pub fn parse_custom_component(html: &str) -> Option<(CustomBlockType, serde_json::Value)> {
+    let html = html.trim();
+    if !html.starts_with('<') || !html.ends_with("/>") { return None; }
+    let inner = &html[1..html.len()-2].trim();
+    let mut parts = inner.splitn(2, char::is_whitespace);
+    let tag = parts.next()?;
+    let ty = CustomBlockType::from_str(tag);
+    if matches!(ty, CustomBlockType::Custom(_)) { return None; }
+    Some((ty, parse_attrs(parts.next().unwrap_or(""))))
+}
+
+fn parse_attrs(a: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for part in a.split_whitespace() {
+        if let Some(eq) = part.find('=') {
+            map.insert(part[..eq].to_string(), serde_json::Value::String(part[eq+1..].trim_matches('"').trim_matches('\'').trim_end_matches('/').to_string()));
+        }
     }
-
-    #[test]
-    fn update_block_merges_content_and_bumps_version() {
-        let (mut doc, root) = doc_with_root();
-        let v0 = doc.block(&root).unwrap().version;
-        doc.apply(Op::UpdateBlock {
-            id: root.clone(),
-            patch: serde_json::json!({ "bold": true }),
-        })
-        .unwrap();
-        let b = doc.block(&root).unwrap();
-        assert_eq!(b.content.0.get("text").unwrap(), "root");
-        assert_eq!(b.content.0.get("bold").unwrap(), true);
-        assert_eq!(b.version, v0 + 1);
-    }
-
-    #[test]
-    fn delete_removes_whole_subtree() {
-        let (mut doc, root) = doc_with_root();
-        let parent = para("p");
-        let pid = parent.id.clone();
-        let child = para("c");
-        let cid = child.id.clone();
-        doc.apply(Op::InsertBlock { parent: root.clone(), after: None, block: parent }).unwrap();
-        doc.apply(Op::InsertBlock { parent: pid.clone(), after: None, block: child }).unwrap();
-        doc.apply(Op::DeleteBlock { id: pid.clone() }).unwrap();
-        assert!(doc.block(&pid).is_none());
-        assert!(doc.block(&cid).is_none(), "子块应随父块删除");
-        assert!(doc.children(&root).is_empty());
-    }
-
-    #[test]
-    fn cannot_delete_root() {
-        let (mut doc, root) = doc_with_root();
-        assert!(doc.apply(Op::DeleteBlock { id: root }).is_err());
-    }
-
-    #[test]
-    fn move_block_reparents() {
-        let (mut doc, root) = doc_with_root();
-        let p1 = para("p1");
-        let p2 = para("p2");
-        let (p1id, p2id) = (p1.id.clone(), p2.id.clone());
-        let c = para("c");
-        let cid = c.id.clone();
-        doc.apply(Op::InsertBlock { parent: root.clone(), after: None, block: p1 }).unwrap();
-        doc.apply(Op::InsertBlock { parent: root.clone(), after: None, block: p2 }).unwrap();
-        doc.apply(Op::InsertBlock { parent: p1id.clone(), after: None, block: c }).unwrap();
-
-        doc.apply(Op::MoveBlock { id: cid.clone(), new_parent: p2id.clone(), after: None }).unwrap();
-        assert!(doc.children(&p1id).is_empty());
-        assert_eq!(doc.children(&p2id)[0].id, cid);
-        assert_eq!(doc.block(&cid).unwrap().parent, Some(p2id));
-    }
-
-    #[test]
-    fn move_into_own_subtree_rejected() {
-        let (mut doc, root) = doc_with_root();
-        let p = para("p");
-        let pid = p.id.clone();
-        let c = para("c");
-        let cid = c.id.clone();
-        doc.apply(Op::InsertBlock { parent: root, after: None, block: p }).unwrap();
-        doc.apply(Op::InsertBlock { parent: pid.clone(), after: None, block: c }).unwrap();
-        // 把 p 移到它的子 c 下 → 应拒绝（环）。
-        assert!(doc.apply(Op::MoveBlock { id: pid, new_parent: cid, after: None }).is_err());
-    }
-
-    #[test]
-    fn update_doc_meta() {
-        let (mut doc, _) = doc_with_root();
-        doc.apply(Op::UpdateDocMeta {
-            doc_id: doc.id.clone(),
-            patch: serde_json::json!({ "title": "New", "tags": ["a", "b"] }),
-        })
-        .unwrap();
-        assert_eq!(doc.title, "New");
-        assert_eq!(doc.tags, vec!["a".to_string(), "b".to_string()]);
-    }
-
-    #[test]
-    fn descendants_preorder() {
-        let (mut doc, root) = doc_with_root();
-        let a = para("a");
-        let aid = a.id.clone();
-        let b = para("b");
-        let bid = b.id.clone();
-        doc.apply(Op::InsertBlock { parent: root.clone(), after: None, block: a }).unwrap();
-        doc.apply(Op::InsertBlock { parent: aid.clone(), after: None, block: b }).unwrap();
-        assert_eq!(doc.descendants(&root), vec![root, aid, bid]);
-    }
+    serde_json::Value::Object(map)
 }

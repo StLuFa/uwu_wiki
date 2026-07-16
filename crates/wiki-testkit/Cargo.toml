@@ -2,18 +2,15 @@
 name = "wiki-testkit"
 version = "0.0.0"
 edition = "2024"
-description = "uwu_wiki 参考内存实现（仅 dev-dependency，不进生产）：全部 7 个存储端口的 HashMap 版"
+description = "uwu_wiki 参考内存实现：全部存储端口的内存版"
 
 [dependencies]
 wiki-core = { path = "../wiki-core" }
-async-trait = "0.1"
-serde_json = "1"
-chrono = { version = "0.4", features = ["serde"] }
-parking_lot = "0.12"
-uuid = { version = "1", features = ["v4"] }
-
-[features]
-default = []
+async-trait.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio.workspace = true

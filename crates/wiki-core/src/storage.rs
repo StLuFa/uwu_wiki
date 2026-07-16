@@ -4,7 +4,7 @@
 //! 生产环境由 `agent-context-db` 注入 PG + Qdrant 后端。
 
 use crate::block::BlockId;
-use crate::doc::{DocId, Document};
+use crate::doc::{ContentType, DocId, Document, DocumentStatus, SpaceId};
 use crate::error::Result;
 use crate::link::WikiLink;
 use async_trait::async_trait;
@@ -32,6 +32,8 @@ pub trait WikiStorage: Send + Sync + 'static {
     fn blob_store(&self) -> Arc<dyn BlobStore>;
     /// 文档版本快照（历史浏览 / diff / 回滚，#5）。
     fn version_store(&self) -> Arc<dyn DocVersionStore>;
+    fn permission_store(&self) -> Arc<dyn PermissionStore>;
+    fn event_bus(&self) -> Arc<dyn EventBus>;
 }
 
 // ===========================================================================
@@ -178,6 +180,13 @@ pub trait LinkStore: Send + Sync {
     async fn upsert_links(&self, from: &BlockId, links: &[WikiLink]) -> Result<()>;
     async fn backlinks(&self, target_key: &str) -> Result<Vec<WikiLink>>;
     async fn broken_links(&self) -> Result<Vec<WikiLink>>;
+
+    // === Cross-reference operations ===
+    async fn resolve_cross_doc(&self, link: &WikiLink) -> Result<Option<DocSummary>>;
+    async fn incoming_count(&self, doc_id: &DocId) -> Result<usize>;
+    async fn outgoing_count(&self, doc_id: &DocId) -> Result<usize>;
+    async fn find_orphans(&self, space_id: &SpaceId) -> Result<Vec<DocId>>;
+    async fn get_citation_graph(&self, doc_id: &DocId, depth: usize) -> Result<Vec<(DocId, DocId, String)>>;
 }
 
 // ===========================================================================
@@ -231,17 +240,110 @@ pub struct DocDiff {
     pub changes: Vec<BlockChange>,
 }
 
+
+// ===========================================================================
+// Merge 结果
+// ===========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeResult {
+    pub success: bool,
+    pub conflicts: Vec<MergeConflict>,
+    pub merged_version: Option<VersionId>,
+    pub strategy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeConflict {
+    pub doc_id: DocId,
+    pub path: String,
+    pub ours: String,
+    pub theirs: String,
+    pub resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocSummary {
+    pub doc_id: DocId,
+    pub title: String,
+    pub content_type: ContentType,
+    pub space_id: SpaceId,
+    pub tags: Vec<String>,
+}
+
 /// 用户级版本快照。与 CRDT OpLog 区分：OpLog 是操作流，此处是可读版本快照。
 ///
 /// 挂 agent-context-db 时，由适配器把这些操作翻译成 context-db 的 commit/DAG，
 /// 真值源唯一。独立部署时用 wiki-testkit 的线性快照实现。
 #[async_trait]
 pub trait DocVersionStore: Send + Sync {
-    async fn snapshot(&self, doc_id: &DocId, doc: &Document, label: Option<String>)
-        -> Result<VersionId>;
+    async fn snapshot(&self, doc_id: &DocId, doc: &Document, label: Option<String>) -> Result<VersionId>;
     async fn list_versions(&self, doc_id: &DocId) -> Result<Vec<VersionEntry>>;
     async fn get_version(&self, doc_id: &DocId, v: &VersionId) -> Result<Document>;
     async fn diff(&self, doc_id: &DocId, a: &VersionId, b: &VersionId) -> Result<DocDiff>;
-    /// 回滚 = 以旧版为内容提交新版（不物理删除中间版本）。
     async fn restore(&self, doc_id: &DocId, v: &VersionId) -> Result<()>;
+
+    // === Git DAG operations ===
+    async fn create_branch(&self, doc_id: &DocId, name: &str, from: &VersionId) -> Result<()>;
+    async fn merge(&self, doc_id: &DocId, source: &str, target: &str) -> Result<MergeResult>;
+    async fn log(&self, doc_id: &DocId, branch: &str, offset: usize, limit: usize) -> Result<Vec<VersionEntry>>;
+    async fn list_branches(&self, doc_id: &DocId) -> Result<Vec<String>>;
+    async fn cherry_pick(&self, doc_id: &DocId, commit: &VersionId, onto: &str) -> Result<VersionId>;
+    async fn create_tag(&self, doc_id: &DocId, name: &str, target: &VersionId) -> Result<()>;
+    async fn list_tags(&self, doc_id: &DocId) -> Result<Vec<(String, VersionId)>>;
 }
+
+// ===========================================================================
+// 端口：权限控制（新增）
+// ===========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Permission {
+    Read,
+    Write,
+    Admin,
+}
+
+#[async_trait]
+pub trait PermissionStore: Send + Sync {
+    async fn check(&self, user: &str, doc_id: &DocId, action: Permission) -> Result<bool>;
+    async fn grant(&self, user: &str, doc_id: &DocId, role: &str) -> Result<()>;
+    async fn revoke(&self, user: &str, doc_id: &DocId) -> Result<()>;
+}
+
+// ===========================================================================
+// 端口：事件总线（新增）
+// ===========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DocEvent {
+    Created { doc_id: DocId, space_id: SpaceId, content_type: ContentType },
+    Updated { doc_id: DocId, version: u64 },
+    Deleted { doc_id: DocId },
+    StatusChanged { doc_id: DocId, from: DocumentStatus, to: DocumentStatus },
+}
+
+#[async_trait]
+pub trait EventBus: Send + Sync {
+    async fn publish(&self, event: DocEvent) -> Result<()>;
+    async fn subscribe(&self, event_types: &[&str]) -> Result<Vec<Box<dyn EventStream>>>;
+}
+
+pub trait EventStream: Send + Sync {
+    fn recv(&mut self) -> Result<DocEvent>;
+}
+
+// ===========================================================================
+// 端口：全文索引增强（升级 TextIndex）
+// ===========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridHit {
+    pub block_id: String,
+    pub text_score: f32,
+    pub vector_score: Option<f32>,
+    pub combined_score: f32,
+    pub snippet: String,
+    pub metadata: Value,
+}
+

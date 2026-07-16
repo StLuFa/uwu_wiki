@@ -8,11 +8,12 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use wiki_core::storage::{
+    DocEvent, EventBus, EventStream, HybridHit, Permission, PermissionStore,
     BlobId, BlobStore, BlockChange, BoolOp, ChangeKind, DocDiff, DocStore, DocVersionStore,
     LinkStore, MatchMode, OpLog, TextHit, TextIndex, TextQuery, VectorSearchResult, VectorStore,
-    VersionEntry, VersionId, WikiStorage,
+    DocSummary, MergeResult, VersionEntry, VersionId, WikiStorage,
 };
-use wiki_core::{BlockId, DocId, Document, Result, WikiError, WikiLink};
+use wiki_core::{BlockId, DocId, Document, Op, Result, SpaceId, WikiError, WikiLink};
 
 // ===========================================================================
 // 顶层门面
@@ -27,6 +28,8 @@ pub struct MemoryWikiStorage {
     links: Arc<MemLinkStore>,
     blobs: Arc<MemBlobStore>,
     versions: Arc<MemVersionStore>,
+    permissions: Arc<MemPermissionStore>,
+    events: Arc<MemEventBus>,
 }
 
 impl MemoryWikiStorage {
@@ -56,6 +59,12 @@ impl WikiStorage for MemoryWikiStorage {
     }
     fn version_store(&self) -> Arc<dyn DocVersionStore> {
         self.versions.clone()
+    }
+    fn permission_store(&self) -> Arc<dyn PermissionStore> {
+        self.permissions.clone()
+    }
+    fn event_bus(&self) -> Arc<dyn EventBus> {
+        self.events.clone()
     }
 }
 
@@ -333,6 +342,12 @@ struct MemLinkStore {
 
 #[async_trait]
 impl LinkStore for MemLinkStore {
+    async fn resolve_cross_doc(&self, _link: &WikiLink) -> Result<Option<DocSummary>> { Ok(None) }
+    async fn incoming_count(&self, _doc_id: &DocId) -> Result<usize> { Ok(0) }
+    async fn outgoing_count(&self, _doc_id: &DocId) -> Result<usize> { Ok(0) }
+    async fn find_orphans(&self, _space_id: &SpaceId) -> Result<Vec<DocId>> { Ok(Vec::new()) }
+    async fn get_citation_graph(&self, _doc_id: &DocId, _depth: usize) -> Result<Vec<(DocId, DocId, String)>> { Ok(Vec::new()) }
+
     async fn upsert_links(&self, from: &BlockId, links: &[WikiLink]) -> Result<()> {
         self.outbound.lock().insert(from.0.clone(), links.to_vec());
         Ok(())
@@ -422,6 +437,16 @@ type VersionRecord = (VersionEntry, Document);
 
 #[async_trait]
 impl DocVersionStore for MemVersionStore {
+    async fn create_branch(&self, _doc_id: &DocId, _name: &str, _from: &VersionId) -> Result<()> { Ok(()) }
+    async fn merge(&self, _doc_id: &DocId, _source: &str, _target: &str) -> Result<MergeResult> {
+        Ok(MergeResult { success: true, conflicts: Vec::new(), merged_version: None, strategy: "fast-forward".into() })
+    }
+    async fn log(&self, _doc_id: &DocId, _branch: &str, _offset: usize, _limit: usize) -> Result<Vec<VersionEntry>> { Ok(Vec::new()) }
+    async fn list_branches(&self, _doc_id: &DocId) -> Result<Vec<String>> { Ok(vec!["main".into()]) }
+    async fn cherry_pick(&self, _doc_id: &DocId, _commit: &VersionId, _onto: &str) -> Result<VersionId> { Ok(VersionId("cherry-picked".into())) }
+    async fn create_tag(&self, _doc_id: &DocId, _name: &str, _target: &VersionId) -> Result<()> { Ok(()) }
+    async fn list_tags(&self, _doc_id: &DocId) -> Result<Vec<(String, VersionId)>> { Ok(Vec::new()) }
+
     async fn snapshot(
         &self,
         doc_id: &DocId,
@@ -463,22 +488,22 @@ impl DocVersionStore for MemVersionStore {
     async fn diff(&self, doc_id: &DocId, a: &VersionId, b: &VersionId) -> Result<DocDiff> {
         let va = self.get_version(doc_id, a).await?;
         let vb = self.get_version(doc_id, b).await?;
-        let ids_a: Vec<&BlockId> = va.blocks.iter().map(|blk| &blk.id).collect();
-        let ids_b: Vec<&BlockId> = vb.blocks.iter().map(|blk| &blk.id).collect();
+        let ids_a: Vec<&BlockId> = va.blocks.iter().map(|blk| blk.id()).collect();
+        let ids_b: Vec<&BlockId> = vb.blocks.iter().map(|blk| blk.id()).collect();
 
         let mut changes = Vec::new();
         for blk in &vb.blocks {
-            if !ids_a.contains(&&blk.id) {
+            if !ids_a.contains(&&blk.id()) {
                 changes.push(BlockChange {
-                    block_id: blk.id.0.clone(),
+                    block_id: blk.id().0.clone(),
                     kind: ChangeKind::Added,
                 });
             }
         }
         for blk in &va.blocks {
-            if !ids_b.contains(&&blk.id) {
+            if !ids_b.contains(&&blk.id()) {
                 changes.push(BlockChange {
-                    block_id: blk.id.0.clone(),
+                    block_id: blk.id().0.clone(),
                     kind: ChangeKind::Removed,
                 });
             }
@@ -564,21 +589,21 @@ mod tests {
         let mut doc = sample_doc();
         let vs = storage.version_store();
 
-        let v1 = vs.snapshot(&doc.id, &doc, Some("v1".into())).await.unwrap();
+        let v1 = vs.snapshot(&doc.id(), &doc, Some("v1".into())).await.unwrap();
 
         // 加一个 block 再快照
         let extra = Block::new(BlockType::Paragraph, BlockContent::text("more"), "a");
         doc.blocks.push(extra);
-        let v2 = vs.snapshot(&doc.id, &doc, Some("v2".into())).await.unwrap();
+        let v2 = vs.snapshot(&doc.id(), &doc, Some("v2".into())).await.unwrap();
 
         assert_eq!(vs.list_versions(&doc.id).await.unwrap().len(), 2);
 
-        let diff = vs.diff(&doc.id, &v1, &v2).await.unwrap();
+        let diff = vs.diff(&doc.id(), &v1, &v2).await.unwrap();
         assert_eq!(diff.changes.len(), 1);
         assert_eq!(diff.changes[0].kind, ChangeKind::Added);
 
         // restore 生成第三个版本
-        vs.restore(&doc.id, &v1).await.unwrap();
+        vs.restore(&doc.id(), &v1).await.unwrap();
         assert_eq!(vs.list_versions(&doc.id).await.unwrap().len(), 3);
     }
 
@@ -620,7 +645,7 @@ mod tests {
             },
         ];
 
-        let result = space.apply_ops(&doc.id, ops).await;
+        let result = space.apply_ops(&doc.id(), ops).await;
         assert!(result.is_err(), "包含无效 Op 的批次应返回错误");
 
         // 验证文档未被修改。
@@ -654,7 +679,7 @@ mod tests {
             BlockContent::text("child"),
             "tester",
         );
-        let child_id = child.id.clone();
+        let child_id = child.id().clone();
 
         let ops = vec![Op::InsertBlock {
             parent: root_id.clone(),
@@ -662,7 +687,7 @@ mod tests {
             block: child,
         }];
 
-        let result = space.apply_ops(&doc.id, ops).await;
+        let result = space.apply_ops(&doc.id(), ops).await;
         assert!(result.is_ok(), "有效批次应成功提交");
         let updated = result.unwrap();
         assert!(updated.block(&child_id).is_some(), "新 Block 应已添加到文档");
@@ -692,13 +717,13 @@ mod tests {
             BlockContent::text("added child"),
             "tester",
         );
-        let child_id = child.id.clone();
+        let child_id = child.id().clone();
         let ops = vec![Op::InsertBlock {
             parent: root_id.clone(),
             after: None,
             block: child,
         }];
-        let updated = space.apply_ops(&doc.id, ops).await.unwrap();
+        let updated = space.apply_ops(&doc.id(), ops).await.unwrap();
         assert!(updated.block(&child_id).is_some());
         assert!(updated.version > original_version);
 
@@ -784,3 +809,49 @@ mod tests {
         }
     }
 }
+
+// ===========================================================================
+// 权限存储（新增）
+// ===========================================================================
+
+#[derive(Default)]
+struct MemPermissionStore {
+    grants: Mutex<HashMap<(String, String), String>>,
+}
+
+#[async_trait]
+impl PermissionStore for MemPermissionStore {
+    async fn check(&self, _user: &str, _doc_id: &DocId, _action: Permission) -> Result<bool> {
+        Ok(true) // testkit: allow all
+    }
+    async fn grant(&self, user: &str, doc_id: &DocId, role: &str) -> Result<()> {
+        self.grants.lock().insert((user.to_string(), doc_id.0.clone()), role.to_string());
+        Ok(())
+    }
+    async fn revoke(&self, user: &str, doc_id: &DocId) -> Result<()> {
+        self.grants.lock().remove(&(user.to_string(), doc_id.0.clone()));
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// 事件总线（新增）
+// ===========================================================================
+
+#[derive(Default)]
+struct MemEventBus {
+    events: Mutex<Vec<DocEvent>>,
+}
+
+#[async_trait]
+impl EventBus for MemEventBus {
+    async fn publish(&self, event: DocEvent) -> Result<()> {
+        self.events.lock().push(event);
+        Ok(())
+    }
+    async fn subscribe(&self, _event_types: &[&str]) -> Result<Vec<Box<dyn EventStream>>> {
+        Ok(Vec::new()) // testkit: no-op subscription
+    }
+}
+
+

@@ -2,13 +2,13 @@
 name = "wiki-graph"
 version = "0.0.0"
 edition = "2024"
-description = "uwu_wiki 智能图：流程图/思维导图节点模型（经 TextUnit 适配调 wiki-llm）"
+description = "uwu_wiki 智能图：流程图/思维导图节点模型"
 
 [dependencies]
 wiki-core = { path = "../wiki-core" }
 wiki-llm = { path = "../wiki-llm" }
-serde = { version = "1", features = ["derive"] }
-rand = "0.8"
+serde.workspace = true
+rand.workspace = true
 
 [features]
 default = []

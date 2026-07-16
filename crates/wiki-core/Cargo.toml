@@ -2,23 +2,20 @@
 name = "wiki-core"
 version = "0.0.0"
 edition = "2024"
-description = "uwu_wiki 核心：Block 引擎 + Document/Op 模型 + 全部存储/LLM 端口 trait 定义（零实现）"
+description = "uwu_wiki 核心：基于 markdown-rs 的 Block 引擎 + Document/Op 模型 + 全部存储端口 trait"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
-thiserror = "1"
-tracing = "0.1"
-
-[features]
-default = []
-backlinks = []
-attachments = []
-versioning = []
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+markdown.workspace = true
+serde_yaml = "0.9"
+blake3 = "1"
 
 [dev-dependencies]
 wiki-testkit = { path = "../wiki-testkit" }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio.workspace = true

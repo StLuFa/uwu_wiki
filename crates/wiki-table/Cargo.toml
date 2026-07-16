@@ -2,14 +2,14 @@
 name = "wiki-table"
 version = "0.0.0"
 edition = "2024"
-description = "uwu_wiki 智能表格：schema/row/view + LLM 列（经 TextUnit 适配调 wiki-llm）"
+description = "uwu_wiki 智能表格：Schema/Row/View 模型"
 
 [dependencies]
 wiki-core = { path = "../wiki-core" }
 wiki-llm = { path = "../wiki-llm" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 
 [features]
 default = []
@@ -17,4 +17,4 @@ formula = []
 llm-fill = []
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio.workspace = true
